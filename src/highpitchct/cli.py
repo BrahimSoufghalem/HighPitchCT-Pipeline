@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .index_dicom import index_dicom_tree
 from .manifest import read_series_manifest
+from .runtime import default_data_root, ensure_writable_output, print_runtime_report
 from .tcia_client import download_series
 
 
@@ -20,14 +21,17 @@ def _parser() -> argparse.ArgumentParser:
 
     download = sub.add_parser("download", help="Download exact TCIA series from a manifest")
     download.add_argument("--series-file", required=True)
-    download.add_argument("--data-root", default="data")
+    download.add_argument("--data-root")
     download.add_argument("--workers", type=int, default=2)
     download.add_argument("--retries", type=int, default=5)
     download.add_argument("--timeout", type=int, default=120)
     download.add_argument("--no-extract", action="store_true")
 
     index = sub.add_parser("index", help="Create a header-only DICOM inventory")
-    index.add_argument("--data-root", default="data")
+    index.add_argument("--data-root")
+
+    environment = sub.add_parser("env", help="Report Kaggle/local RAM, disk, and GPUs")
+    environment.add_argument("--data-root")
     return parser
 
 
@@ -38,8 +42,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"enabled_series": len(specs)}, indent=2))
         return 0
 
+    if args.command == "env":
+        print_runtime_report(args.data_root)
+        return 0
+
+    data_root = ensure_writable_output(args.data_root or default_data_root())
+
     if args.command == "index":
-        print(json.dumps(index_dicom_tree(args.data_root), indent=2))
+        print(json.dumps(index_dicom_tree(data_root), indent=2))
         return 0
 
     specs = read_series_manifest(args.series_file)
@@ -54,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
             pool.submit(
                 download_series,
                 spec,
-                args.data_root,
+                data_root,
                 retries=args.retries,
                 timeout=args.timeout,
                 extract=not args.no_extract,

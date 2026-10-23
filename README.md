@@ -12,7 +12,7 @@
 4. **Stage-Gate.** لا نبدأ مرحلة جديدة قبل توثيق واختبار وقبول المرحلة السابقة على بيانات اصطناعية وبيانات TCIA حقيقية.
 5. **قابلية التكرار.** كل تنزيل له Manifest وحجم وSHA-256 وحالة محفوظة.
 
-## ما الذي ينفذه الإصدار 0.1.0؟
+## ما الذي ينفذه الإصدار 0.2.0؟
 
 - قراءة ملف CSV يحدد SeriesInstanceUID المطلوب بدقة.
 - تنزيل ZIP لكل سلسلة عبر واجهة NBIA العامة.
@@ -22,11 +22,12 @@
 - منع Zip Slip أثناء الاستخراج.
 - إنشاء سجل JSON لكل تنزيل يتضمن SHA-256.
 - فهرسة DICOM دون تحميل PixelData، مع تجزئة PatientID بدل تخزينه نصيًا.
+- اكتشاف Kaggle واختيار `/kaggle/working/highpitchct-data` تلقائيًا.
+- أمر `hpct env` لفحص RAM والقرص وبطاقات GPU قبل بدء أي تجربة.
 
-## التجهيز
+## التجهيز المحلي
 
 ```bash
-# Linux/macOS
 bash scripts/bootstrap.sh
 source .venv/bin/activate
 ```
@@ -40,6 +41,24 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 python -m unittest discover -s tests -v
 ```
+
+## التشغيل على Kaggle
+
+يوجد Notebook جاهز في `notebooks/00_kaggle_stage0.ipynb`. في Kaggle:
+
+1. فعّل **Internet** لتنزيل المستودع وبيانات TCIA.
+2. Stage 0 لا يحتاج GPU؛ استخدم CPU كي لا تستهلك حصة GPU.
+3. عند مراحل reconstruction/training اختر **GPU T4 x2**.
+4. لا تكتب داخل `/kaggle/input`؛ الأداة تختار تلقائيًا `/kaggle/working/highpitchct-data`.
+
+```bash
+!git clone https://github.com/BrahimSoufghalem/HighPitchCT-Pipeline.git
+%cd HighPitchCT-Pipeline
+!python -m pip install -q -e .
+!hpct env
+```
+
+التفاصيل وحدود الذاكرة والقرص موجودة في `docs/03_kaggle.md`.
 
 ## تجهيز قائمة البيانات
 
@@ -72,20 +91,24 @@ hpct validate-manifest --series-file configs/series.csv
 
 ## التنزيل والفهرسة
 
-```bash
-hpct download \
-  --series-file configs/series.csv \
-  --data-root data \
-  --workers 2 \
-  --retries 5
+على الحاسوب المحلي يمكن تحديد المسار صراحةً:
 
+```bash
+hpct download --series-file configs/series.csv --data-root data --workers 2 --retries 5
 hpct index --data-root data
+```
+
+على Kaggle يكفي حذف `--data-root`:
+
+```bash
+hpct download --series-file /kaggle/working/series.csv --workers 2 --retries 5
+hpct index
 ```
 
 البنية الناتجة:
 
 ```text
-data/
+<data-root>/
 ├── incoming/                 # ZIP النهائي وملفات .part المؤقتة
 ├── raw/tcia/<case>/<role>/   # DICOM المستخرج دون تعديل
 └── manifests/
