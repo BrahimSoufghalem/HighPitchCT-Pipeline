@@ -27,7 +27,7 @@
 
 ```bash
 # Linux/macOS
-./scripts/bootstrap.sh
+bash scripts/bootstrap.sh
 source .venv/bin/activate
 ```
 
