@@ -1,0 +1,2 @@
+case_id,series_instance_uid,role,description,enabled
+pilot_case,1.2.840.113654.2.55.1234567890,unknown,Replace with a real TCIA SeriesInstanceUID,false
