@@ -26,12 +26,18 @@ class SeriesPaths:
     state: Path
 
 
-def series_paths(data_root: str | Path, spec: SeriesSpec) -> SeriesPaths:
+def series_paths(
+    data_root: str | Path,
+    spec: SeriesSpec,
+    *,
+    incoming_root: str | Path | None = None,
+) -> SeriesPaths:
     root = Path(data_root)
+    base_incoming = Path(incoming_root) if incoming_root is not None else (root / "incoming")
     case_id = safe_component(spec.case_id)
     role = safe_component(spec.role)
     uid = safe_component(spec.series_instance_uid)
-    incoming = root / "incoming" / case_id / role
+    incoming = base_incoming / case_id / role
     return SeriesPaths(
         archive=incoming / f"{uid}.zip",
         partial=incoming / f"{uid}.zip.part",
