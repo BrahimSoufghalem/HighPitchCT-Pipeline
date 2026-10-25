@@ -4,10 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import pydicom
-from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
-from pydicom.sequence import Sequence
-from pydicom.uid import ImplicitVRLittleEndian
+try:
+    import pydicom
+    from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+    from pydicom.sequence import Sequence
+    from pydicom.uid import ImplicitVRLittleEndian
+
+    HAS_PYDICOM = True
+except ImportError:
+    HAS_PYDICOM = False
 
 from highpitchct.ctpd_tags import (
     CT_IMAGE_SOP_CLASS_UID,
@@ -107,6 +112,7 @@ def _write_synthetic_ct_image(
     ds.save_as(str(path), write_like_original=False)
 
 
+@unittest.skipUnless(HAS_PYDICOM, "pydicom is required for DICOM-CT-PD indexing tests")
 class CtpdAndIndexTests(unittest.TestCase):
     def test_private_un_tags_and_reference_link_decode(self):
         with tempfile.TemporaryDirectory() as tmp:
