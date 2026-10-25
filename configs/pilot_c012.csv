@@ -1,5 +1,5 @@
 case_id,series_instance_uid,role,body_part,expected_files,expected_bytes,description,enabled
-case_C012,1.2.840.113713.4.2.53385152012747770428770581794205126638,projection_full,CHEST,,,C012 Full-dose raw helical chest projections (SOMATOM Definition AS+ pitch ~0.9),true
+case_C012,1.2.840.113713.4.2.53385152012747770428770581794205126638,projection_full,CHEST,13446,,C012 Full-dose raw helical chest projections (SOMATOM Definition AS+ pitch ~0.9),true
 case_C012,1.2.840.113713.4.100.1.2.209025642610450817922674359193580,reconstruction_published,CHEST,351,184836276,C012 Full-dose published vendor CT images (visual orientation/coverage check only),true
 case_C012,1.2.840.113713.4.2.321703330912100777201246094531012278672,projection_low,CHEST,,,C012 Low-dose raw projections (disabled by default to save 50% disk space),false
 case_C012,1.2.840.113713.4.100.1.2.290573188111996224609135827512506,reconstruction_low,CHEST,351,184836242,C012 Low-dose vendor CT images (disabled by default),false

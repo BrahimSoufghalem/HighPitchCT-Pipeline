@@ -74,10 +74,20 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep .zip archive after extraction (default on Full profile)",
     )
-    download.add_argument("--workers", type=int, default=2)
+    download.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Parallel series download workers across admitted patients (default: 4)",
+    )
     download.add_argument("--retries", type=int, default=5)
     download.add_argument("--timeout", type=int, default=120)
     download.add_argument("--no-extract", action="store_true")
+    download.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable live tqdm progress bars and stderr status logs",
+    )
 
     index = sub.add_parser(
         "index",
@@ -89,6 +99,17 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         dest="scan_dirs",
         help="Optional directory to scan (e.g., /kaggle/input/... or external drive); repeatable",
+    )
+    index.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Parallel threads for header-only DICOM scanning (default: 8)",
+    )
+    index.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable live tqdm progress bar during indexing",
     )
 
     environment = sub.add_parser(
@@ -153,8 +174,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "index":
+        if args.workers < 1:
+            raise SystemExit("--workers must be at least 1")
         env_prof = resolve_environment_profile(data_root=args.data_root)
-        summary = index_dicom_tree(env_prof.data_root, scan_dirs=args.scan_dirs)
+        summary = index_dicom_tree(
+            env_prof.data_root,
+            scan_dirs=args.scan_dirs,
+            workers=args.workers,
+            show_progress=not args.no_progress,
+        )
         # Print concise summary without dumping thousands of rows to stdout
         compact = {k: v for k, v in summary.items() if k != "series_summaries"}
         compact["series_validation_statuses"] = {
@@ -197,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         retries=args.retries,
         timeout=args.timeout,
         extract=not args.no_extract,
+        show_progress=not args.no_progress,
     )
     print(json.dumps({k: v for k, v in summary.items() if k != "results"}, indent=2))
     return 1 if summary["failed_series"] > 0 else 0

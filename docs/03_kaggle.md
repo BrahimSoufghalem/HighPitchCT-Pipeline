@@ -66,6 +66,9 @@ if not repo_dir.exists():
         f"git clone https://{token}@github.com/BrahimSoufghalem/HighPitchCT-Pipeline.git {repo_dir}"
     )
     assert rc == 0, "فشل استنساخ المستودع؛ تأكد من تفعيل Internet وصلاحية GITHUB_TOKEN"
+else:
+    rc = os.system(f"git -C {repo_dir} pull --ff-only")
+    assert rc == 0, "فشل تحديث المستودع عبر git pull"
 
 %cd /kaggle/working/HighPitchCT-Pipeline
 !python -m pip install -q -e .
@@ -78,16 +81,16 @@ if not repo_dir.exists():
 - `"max_disk_gb": 18.0`
 - `"incoming_root": "/tmp/highpitchct-incoming"`
 
-### الخطوة 3: تجربة المريض `C012` الجاهز مباشرةً (الخلية الثانية)
+### الخطوة 3: تجربة المريض `C012` مع شريط التقدم الحيّ وتقرير السرعة (الخلية الثانية)
 ```bash
 !hpct validate-manifest --series-file configs/pilot_c012.csv
-!hpct download --series-file configs/pilot_c012.csv --workers 2 --retries 5
-!hpct index
+!hpct download --series-file configs/pilot_c012.csv --workers 4 --retries 5
+!hpct index --workers 8
 ```
 
-### الخطوة 4: أو اكتشاف وتنزيل عدة حالات صدر حتى سقف `18 GiB` تلقائيًا
+### الخطوة 4: أو اكتشاف وتنزيل عدة حالات صدر بالتوازي الفائق حتى سقف `18 GiB` تلقائيًا
 ```bash
-# يكتشف مثلاً 20 حالة صدر من TCIA، وعند التنزيل على Kaggle سيتوقف ذكيًا عند ~18 GiB دون امتلاء القرص!
+# يكتشف مثلاً 20 حالة صدر من TCIA، وينزّلها بالتوازي الكامل عبر 4 خيوط مع شريط tqdm حيّ، ويتوقف ذكيًا عند ~18 GiB!
 !hpct discover-tcia \
   --collection LDCT-and-Projection-data \
   --body-part CHEST \
@@ -95,13 +98,16 @@ if not repo_dir.exists():
   --max-cases 20 \
   --output /kaggle/working/chest_20_cases.csv
 
-!hpct download --series-file /kaggle/working/chest_20_cases.csv --workers 2 --retries 5
-!hpct index
+!hpct download --series-file /kaggle/working/chest_20_cases.csv --workers 4 --retries 5
+!hpct index --workers 8
 ```
 
-### الخطوة 5: استعراض جدول الفيزياء والتدقيق في Kaggle
+### الخطوة 5: استعراض تقرير السرعة (`download_report.csv`) وجدول الفيزياء والتدقيق (`series_inventory.csv`)
 ```python
 import pandas as pd
+
+dl_rep = pd.read_csv("/kaggle/working/highpitchct-data/manifests/download_report.csv")
+display(dl_rep)
 
 inv = pd.read_csv("/kaggle/working/highpitchct-data/manifests/series_inventory.csv")
 display(inv[[

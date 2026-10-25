@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import time
 
 from .ctpd_tags import (
     classify_dicom_sop,
@@ -14,6 +17,7 @@ from .ctpd_tags import (
     decode_tag,
     extract_referenced_raw_series_uid,
 )
+from .progress import ProgressReporter
 
 _FILE_FIELDS = [
     "source_path",
@@ -125,17 +129,95 @@ def _median(values: list[float]) -> float:
     return 0.5 * (s[mid - 1] + s[mid])
 
 
+_SKIP_EXTENSIONS = {".csv", ".json", ".txt", ".md", ".zip", ".part", ".xlsx"}
+
+
+def _collect_candidates(sroot: Path) -> list[tuple[Path, Path, int]]:
+    """Fast recursive os.scandir candidate collector sorted deterministically by path."""
+    if not sroot.exists():
+        return []
+    if sroot.is_file():
+        return [(sroot.parent, sroot, sroot.stat().st_size)]
+
+    found: list[tuple[Path, Path, int]] = []
+    stack = [str(sroot)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if ".extracting_" in entry.name:
+                                continue
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            dot = entry.name.rfind(".")
+                            if dot != -1 and entry.name[dot:].lower() in _SKIP_EXTENSIONS:
+                                continue
+                            found.append(
+                                (sroot, Path(entry.path), entry.stat(follow_symlinks=False).st_size)
+                            )
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    found.sort(key=lambda item: str(item[1]))
+    return found
+
+
+def _accumulate_series_entry(series_accum: dict[str, dict], pmeta: dict) -> None:
+    suid = pmeta["suid"]
+    acc = series_accum.get(suid)
+    if acc is None:
+        acc = {
+            "series_instance_uid": suid,
+            "study_instance_uid": pmeta["study_instance_uid"],
+            "patient_id_sha256_12": pmeta["patient_id_sha256_12"],
+            "dicom_kind": pmeta["dicom_kind"],
+            "body_part": pmeta["body_part"],
+            "manufacturer": pmeta["manufacturer"],
+            "series_description": pmeta["series_description"],
+            "file_count": 0,
+            "total_bytes": 0,
+            "instances": [],
+            "traj": [],
+            "slice_zs": [],
+            "referenced_raw_uids": set(),
+            "meta": {},
+        }
+        series_accum[suid] = acc
+
+    if pmeta["series_meta"] and not acc["meta"]:
+        acc["meta"] = pmeta["series_meta"]
+
+    acc["file_count"] += 1
+    acc["total_bytes"] += pmeta["fbytes"]
+    inst_int = pmeta["inst_int"]
+    if inst_int is not None:
+        acc["instances"].append(inst_int)
+    if pmeta["phi0_val"] is not None and pmeta["z0_val"] is not None and inst_int is not None:
+        acc["traj"].append((inst_int, float(pmeta["phi0_val"]), float(pmeta["z0_val"])))
+    if pmeta["slice_z_val"] is not None:
+        acc["slice_zs"].append(pmeta["slice_z_val"])
+    if pmeta["ref_raw_uid"]:
+        acc["referenced_raw_uids"].add(pmeta["ref_raw_uid"])
+
+
 def index_dicom_tree(
     data_root: str | Path,
     *,
     scan_dirs: list[str | Path] | None = None,
+    workers: int = 8,
+    show_progress: bool = False,
 ) -> dict:
-    """Scan DICOM headers without loading PixelData and audit series geometry & completeness."""
+    """Scan DICOM headers in parallel without loading PixelData and audit series geometry."""
     try:
         import pydicom
     except ImportError as error:
         raise RuntimeError("pydicom is required for the index command") from error
 
+    t_start = time.monotonic()
     root = Path(data_root).expanduser().resolve()
     default_scan = root / "raw" / "tcia"
     roots_to_scan = (
@@ -149,32 +231,20 @@ def index_dicom_tree(
     output_json = root / "manifests" / "dicom_index_summary.json"
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    candidates: list[tuple[Path, Path]] = []
+    candidates: list[tuple[Path, Path, int]] = []
     for sroot in roots_to_scan:
-        if not sroot.exists():
-            continue
-        if sroot.is_file():
-            candidates.append((sroot.parent, sroot))
-            continue
-        for p in sorted(sroot.rglob("*")):
-            if not p.is_file():
-                continue
-            # Skip non-DICOM metadata files such as NBIA metadata.csv or .json/.txt
-            if p.suffix.lower() in {".csv", ".json", ".txt", ".md", ".zip", ".part", ".xlsx"}:
-                continue
-            candidates.append((sroot, p))
+        candidates.extend(_collect_candidates(sroot))
 
-    file_rows: list[dict[str, str | int | float]] = []
-    series_accum: dict[str, dict] = {}
+    seen_meta_suids: set[str] = set()
 
-    for base_dir, path in candidates:
+    def _scan_one(item: tuple[Path, Path, int]) -> tuple[dict[str, str | int | float], dict | None]:
+        base_dir, path, fbytes = item
         record: dict[str, str | int | float] = {field: "" for field in _FILE_FIELDS}
         try:
             rel = str(path.relative_to(root))
         except ValueError:
             rel = str(path.relative_to(base_dir))
         record["source_path"] = rel
-        fbytes = path.stat().st_size
         record["file_bytes"] = fbytes
 
         try:
@@ -223,56 +293,73 @@ def index_dicom_tree(
                     record["slice_z_mm"] = round(slice_z_val, 5)
 
             suid = str(record["series_instance_uid"])
+            parsed_meta: dict | None = None
             if suid:
-                acc = series_accum.get(suid)
-                if acc is None:
-                    acc = {
-                        "series_instance_uid": suid,
-                        "study_instance_uid": str(record["study_instance_uid"]),
-                        "patient_id_sha256_12": pid_hash,
-                        "dicom_kind": kind,
-                        "body_part": str(record["body_part"]),
-                        "manufacturer": str(record["manufacturer"]),
-                        "series_description": str(record["series_description"]),
-                        "file_count": 0,
-                        "total_bytes": 0,
-                        "instances": [],
-                        "traj": [],  # (inst, phi0, z0)
-                        "slice_zs": [],
-                        "referenced_raw_uids": set(),
-                        "meta": {},
+                series_meta = None
+                if kind == "dicom_ct_pd_projection" and suid not in seen_meta_suids:
+                    seen_meta_suids.add(suid)
+                    series_meta = {
+                        "detector_rows": decode_named_ctpd_tag(ds, "detector_rows"),
+                        "detector_cols": decode_named_ctpd_tag(ds, "detector_cols"),
+                        "du_mm": decode_named_ctpd_tag(ds, "du_mm"),
+                        "dv_mm": decode_named_ctpd_tag(ds, "dv_mm"),
+                        "rho0_mm": decode_named_ctpd_tag(ds, "rho0_mm"),
+                        "d0_mm": decode_named_ctpd_tag(ds, "d0_mm"),
+                        "detector_shape": decode_named_ctpd_tag(ds, "detector_shape"),
+                        "ffs_mode": decode_named_ctpd_tag(ds, "ffs_mode"),
+                        "angular_steps_per_rotation": decode_named_ctpd_tag(
+                            ds, "angular_steps_per_rotation"
+                        ),
+                        "nominal_spiral_pitch": decode_tag(ds, 0x0018, 0x9311, "FD"),
                     }
-                    if kind == "dicom_ct_pd_projection":
-                        acc["meta"] = {
-                            "detector_rows": decode_named_ctpd_tag(ds, "detector_rows"),
-                            "detector_cols": decode_named_ctpd_tag(ds, "detector_cols"),
-                            "du_mm": decode_named_ctpd_tag(ds, "du_mm"),
-                            "dv_mm": decode_named_ctpd_tag(ds, "dv_mm"),
-                            "rho0_mm": decode_named_ctpd_tag(ds, "rho0_mm"),
-                            "d0_mm": decode_named_ctpd_tag(ds, "d0_mm"),
-                            "detector_shape": decode_named_ctpd_tag(ds, "detector_shape"),
-                            "ffs_mode": decode_named_ctpd_tag(ds, "ffs_mode"),
-                            "angular_steps_per_rotation": decode_named_ctpd_tag(
-                                ds, "angular_steps_per_rotation"
-                            ),
-                            "nominal_spiral_pitch": decode_tag(ds, 0x0018, 0x9311, "FD"),
-                        }
-                    series_accum[suid] = acc
-
-                acc["file_count"] += 1
-                acc["total_bytes"] += fbytes
-                if inst_int is not None:
-                    acc["instances"].append(inst_int)
-                if phi0_val is not None and z0_val is not None and inst_int is not None:
-                    acc["traj"].append((inst_int, float(phi0_val), float(z0_val)))
-                if slice_z_val is not None:
-                    acc["slice_zs"].append(slice_z_val)
-                if ref_raw_uid:
-                    acc["referenced_raw_uids"].add(ref_raw_uid)
+                parsed_meta = {
+                    "suid": suid,
+                    "study_instance_uid": str(record["study_instance_uid"]),
+                    "patient_id_sha256_12": pid_hash,
+                    "dicom_kind": kind,
+                    "body_part": str(record["body_part"]),
+                    "manufacturer": str(record["manufacturer"]),
+                    "series_description": str(record["series_description"]),
+                    "fbytes": fbytes,
+                    "inst_int": inst_int,
+                    "phi0_val": phi0_val,
+                    "z0_val": z0_val,
+                    "slice_z_val": slice_z_val,
+                    "ref_raw_uid": ref_raw_uid,
+                    "series_meta": series_meta,
+                }
+            return record, parsed_meta
         except Exception as error:
             record["read_error"] = f"{type(error).__name__}: {error}"
+            return record, None
 
-        file_rows.append(record)
+    file_rows: list[dict[str, str | int | float]] = []
+    series_accum: dict[str, dict] = {}
+
+    if candidates:
+        effective_workers = max(1, min(int(workers), len(candidates)))
+        with ProgressReporter(
+            total=len(candidates),
+            desc="🔍 Indexing DICOM headers",
+            unit="file",
+            unit_scale=False,
+            colour="green",
+            enabled=show_progress,
+        ) as bar:
+            if effective_workers == 1:
+                iterator = (_scan_one(c) for c in candidates)
+                for record, pmeta in iterator:
+                    file_rows.append(record)
+                    bar.update(1)
+                    if pmeta is not None:
+                        _accumulate_series_entry(series_accum, pmeta)
+            else:
+                with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                    for record, pmeta in pool.map(_scan_one, candidates, chunksize=64):
+                        file_rows.append(record)
+                        bar.update(1)
+                        if pmeta is not None:
+                            _accumulate_series_entry(series_accum, pmeta)
 
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=_FILE_FIELDS)
@@ -451,12 +538,14 @@ def index_dicom_tree(
         writer.writerows(series_rows)
 
     errors = sum(bool(row["read_error"]) for row in file_rows)
+    elapsed_s = round(max(time.monotonic() - t_start, 1e-4), 3)
     summary = {
         "scanned_roots": [str(p) for p in roots_to_scan],
         "candidate_files": len(candidates),
         "indexed_files": len(file_rows) - errors,
         "read_errors": errors,
         "series_count": len(series_rows),
+        "elapsed_seconds": elapsed_s,
         "series_instance_uids": [str(r["series_instance_uid"]) for r in series_rows],
         "csv": str(output_csv),
         "series_inventory_csv": str(series_csv),

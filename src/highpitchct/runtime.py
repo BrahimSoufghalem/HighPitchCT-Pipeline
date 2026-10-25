@@ -72,15 +72,27 @@ def ensure_writable_output(path: str | Path) -> Path:
 
 
 def directory_used_bytes(path: str | Path) -> int:
-    """Compute total regular-file bytes inside a directory tree."""
+    """Compute finalized regular-file bytes inside a directory tree via fast os.scandir."""
     root = Path(path)
     if not root.exists():
         return 0
     total = 0
-    for entry in root.rglob("*"):
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
         try:
-            if entry.is_file() and not entry.is_symlink():
-                total += entry.stat().st_size
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            # Transient atomic extraction dirs are already accounted for in _reserved_bytes
+                            if ".extracting_" in entry.name:
+                                continue
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
         except OSError:
             continue
     return total
@@ -180,23 +192,35 @@ class DiskBudgetGuard:
 
     def try_reserve(self, estimated_bytes: int) -> tuple[bool, dict[str, int | float | None]]:
         """Atomically reserve bytes if within max_disk_bytes and filesystem free space."""
-        needed = max(0, int(estimated_bytes))
+        return self.try_update_reservation(0, estimated_bytes)
+
+    def try_update_reservation(
+        self, old_reserved: int, new_reserved: int
+    ) -> tuple[bool, dict[str, int | float | None]]:
+        """Atomically swap an existing reservation for an exact uncompressed byte reservation."""
+        old_val = max(0, int(old_reserved))
+        new_val = max(0, int(new_reserved))
         with self._lock:
             on_disk = directory_used_bytes(self.data_root)
-            committed = on_disk + self._reserved_bytes
+            other_reserved = max(0, self._reserved_bytes - old_val)
+            projected = on_disk + other_reserved + new_val
             fs_free = shutil.disk_usage(self.data_root).free
             info = {
                 "on_disk_bytes": on_disk,
                 "reserved_bytes": self._reserved_bytes,
-                "needed_bytes": needed,
+                "needed_bytes": new_val,
                 "max_disk_bytes": self.max_disk_bytes,
                 "filesystem_free_bytes": fs_free,
             }
-            if needed > 0 and needed > fs_free:
+            if new_val > 0 and new_val > fs_free:
                 return False, info
-            if self.max_disk_bytes is not None and (committed + needed) > self.max_disk_bytes:
+            if (
+                self.max_disk_bytes is not None
+                and not (old_val > 0 and new_val <= old_val)
+                and projected > self.max_disk_bytes
+            ):
                 return False, info
-            self._reserved_bytes += needed
+            self._reserved_bytes = other_reserved + new_val
             return True, info
 
     def release(self, reserved_bytes: int) -> None:
@@ -208,7 +232,7 @@ class DiskBudgetGuard:
             return True
         with self._lock:
             on_disk = directory_used_bytes(self.data_root)
-            return (on_disk + max(0, int(extra_bytes))) <= self.max_disk_bytes
+            return (on_disk + self._reserved_bytes + max(0, int(extra_bytes))) <= self.max_disk_bytes
 
 
 def _ram_bytes() -> int | None:

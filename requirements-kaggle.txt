@@ -1,3 +1,5 @@
 # Kaggle already provides NumPy, PyTorch, CUDA and common scientific packages.
 # Keep Stage 0 additions intentionally small and pinned to a safe major range.
 pydicom>=2.4,<4
+requests>=2.28
+tqdm>=4.65
