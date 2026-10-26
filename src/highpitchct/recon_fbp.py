@@ -215,7 +215,20 @@ def extrapolate_sinogram(
         beta_min = float(beta_s[0])
         beta_max = float(beta_s[-1])
 
-        # Step 1: Exact 2D fan-beam conjugate-ray fill (beta' = beta +/- (pi + 2*alpha), u' = -u)
+        # Step 0: Pre-fill any completely unmeasured lateral border column (e.g. quarter-offset edge)
+        # from its nearest measured column at angles where that neighbor is measured, so border columns
+        # never get interpolated across 180 deg in Step 2.
+        col_has_meas = np.any(cur_mask, axis=0)
+        if not np.all(col_has_meas) and np.any(col_has_meas):
+            meas_cols = np.where(col_has_meas)[0]
+            for m_un in np.where(~col_has_meas)[0]:
+                nearest_m = int(meas_cols[np.argmin(np.abs(meas_cols - m_un))])
+                nb_mask = cur_mask[:, nearest_m]
+                cur_sino[nb_mask, m_un] = cur_sino[nb_mask, nearest_m]
+                cur_mask[nb_mask, m_un] = True
+                interp_filled[s_idx, nb_mask, m_un] = True
+
+        # Step 1: Exact 2D fan-beam conjugate-ray fill (beta' = beta + 2*alpha +/- pi, u' = -u)
         if mode == "conjugate_feather" and n_beta >= 2:
             miss_k, miss_m = np.where(~cur_mask)
             if miss_k.size > 0:
@@ -236,7 +249,9 @@ def extrapolate_sinogram(
                         continue
                     ks = miss_k[cand_idx]
                     ms = miss_m[cand_idx]
-                    b_conj = beta_s[ks] + sign * (math.pi + 2.0 * alpha_u[ms])
+                    # Exact conjugate angle: beta + alpha' = beta + alpha +/- pi with alpha' = -alpha
+                    # => beta' = beta + 2*alpha +/- pi (sign of +2*alpha is invariant under +/-pi!)
+                    b_conj = beta_s[ks] + 2.0 * alpha_u[ms] + sign * math.pi
                     if is_full and n_beta >= 2:
                         # Wrap into [beta_min, beta_min + 2*pi)
                         b_conj = beta_min + np.mod(b_conj - beta_min, 2.0 * math.pi)
@@ -265,10 +280,10 @@ def extrapolate_sinogram(
                     mc1 = m1[sub]
                     wmc = wm[sub]
                     ok4 = (
-                        mask_orig[s_idx, k0, mc0]
-                        & mask_orig[s_idx, k0, mc1]
-                        & mask_orig[s_idx, k1, mc0]
-                        & mask_orig[s_idx, k1, mc1]
+                        cur_mask[k0, mc0]
+                        & cur_mask[k0, mc1]
+                        & cur_mask[k1, mc0]
+                        & cur_mask[k1, mc1]
                     )
                     if not np.any(ok4):
                         continue
@@ -310,7 +325,7 @@ def extrapolate_sinogram(
             cur_mask[miss_k_col, m_idx] = True
             interp_filled[s_idx, miss_k_col, m_idx] = True
 
-        # Step 3: Fill any completely unmeasured edge columns (e.g. quarter-offset border column)
+        # Step 3: Fill any remaining unmeasured pixels along u
         if not np.all(cur_mask):
             for k_idx in range(n_beta):
                 row_mask = cur_mask[k_idx, :]
@@ -326,14 +341,16 @@ def extrapolate_sinogram(
                 cur_mask[k_idx, miss_m_row] = True
                 interp_filled[s_idx, k_idx, miss_m_row] = True
 
-        # Step 4: Suppress column-to-column staircase steps strictly inside interp_filled
-        # (leaving both mask_orig and conj_filled 100% exact) before horizontal Ram-Lak filtering.
-        interp_s = interp_filled[s_idx]
-        if np.any(interp_s) and n_u >= 3:
-            for _ in range(4):
+        # Step 4: Feather transitions across all unmeasured pixels (~mask_orig[s_idx]) along (u, k)
+        # while keeping every originally measured pixel (mask_orig[s_idx]) 100% untouched and exact.
+        unmeas_s = ~mask_orig[s_idx]
+        if np.any(unmeas_s) and n_u >= 3 and n_beta >= 3:
+            for _ in range(6):
                 pad_u = np.pad(cur_sino, ((0, 0), (1, 1)), mode="edge")
                 smooth_u = 0.25 * pad_u[:, :-2] + 0.50 * pad_u[:, 1:-1] + 0.25 * pad_u[:, 2:]
-                cur_sino = np.where(interp_s, smooth_u, cur_sino)
+                pad_k = np.pad(smooth_u, ((1, 1), (0, 0)), mode="edge")
+                smooth_ku = 0.25 * pad_k[:-2, :] + 0.50 * pad_k[1:-1, :] + 0.25 * pad_k[2:, :]
+                cur_sino = np.where(unmeas_s, smooth_ku, cur_sino)
 
         completed[s_idx] = np.maximum(cur_sino, 0.0).astype(np.float32)
 
@@ -726,10 +743,12 @@ def reconstruct_fanbeam_fbp(
 
     d_xy = active_fov / float(n_xy)
     half_idx = 0.5 * (n_xy - 1.0)
-    # Radiological supine axial display convention:
-    #   Col 0 -> -x (Patient Right), Col W-1 -> +x (Patient Left)
+    # Radiological supine axial display convention (matching DICOM LPS / Vendor CT slices):
+    #   In DICOM-CT-PD Figure 5 (left-handed table-view system), +x is Patient Right (Liver)
+    #   and -x is Patient Left (Heart). Standard radiological viewing (feet-to-head) places:
+    #   Col 0 -> +x (Patient Right), Col W-1 -> -x (Patient Left)
     #   Row 0 -> +y (Anterior / Sternum), Row H-1 -> -y (Posterior / Spine & Table)
-    x_mm = float(center_xy_mm[0]) + (np.arange(n_xy, dtype=np.float64) - half_idx) * d_xy
+    x_mm = float(center_xy_mm[0]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
     y_mm = float(center_xy_mm[1]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
 
     yy_grid, xx_grid = np.meshgrid(y_mm, x_mm, indexing="ij")
@@ -861,7 +880,7 @@ def reconstruct_fanbeam_fbp_scalar_ref(
     active_fov = scanner_fov if fov_mm is None else float(fov_mm)
     d_xy = active_fov / float(n_xy)
     half_idx = 0.5 * (n_xy - 1.0)
-    x_mm = float(center_xy_mm[0]) + (np.arange(n_xy, dtype=np.float64) - half_idx) * d_xy
+    x_mm = float(center_xy_mm[0]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
     y_mm = float(center_xy_mm[1]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
 
     r_max_recon = min(0.5 * active_fov, 0.5 * scanner_fov)

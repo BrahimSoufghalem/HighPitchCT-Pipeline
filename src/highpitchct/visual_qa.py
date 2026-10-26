@@ -631,7 +631,7 @@ def save_stage3_phantom_fbp_visual_qa(
     ax1 = fig.add_subplot(2, 3, 1)
     im1 = ax1.imshow(gt_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal")
     ax1.set_title("A. Exact 3D Phantom Ground Truth [-1000, 600] HU")
-    ax1.set_xlabel("x [mm] (+x = Patient Left)")
+    ax1.set_xlabel("x [mm] (Radiological: Left=Pat.Right, Right=Pat.Left)")
     ax1.set_ylabel("y [mm] (+y = Anterior Sternum)")
     fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
@@ -778,7 +778,7 @@ def save_stage3_real_fbp_visual_qa(
     ax1 = fig.add_subplot(2, 3, 1)
     im1 = ax1.imshow(ref_fbp_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=extent, aspect="equal")
     ax1.set_title(f"1. Our x_reference FBP (p={native_pitch:.2f}, Lung/Chest [-1000, 400] HU)")
-    ax1.set_xlabel("x [mm] (+x = Patient Left)")
+    ax1.set_xlabel("x [mm] (Radiological: Left=Pat.Right, Right=Pat.Left)")
     ax1.set_ylabel("y [mm] (+y = Anterior)")
     fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 

@@ -502,10 +502,10 @@ def _run_stage3_synthetic_phantom_check(
         fbp_hp_inpaint.hu_slices[0], gt_hu, fov_mask=fbp_ref.fov_mask
     )
 
-    # Radiological orientation ROI sanity checks (+x Left, +y Anterior, -y Posterior)
+    # Radiological orientation ROI sanity checks (+x Right, -x Left, +y Anterior, -y Posterior)
     yy_p, xx_p = np.meshgrid(fbp_ref.y_mm, fbp_ref.x_mm, indexing="ij")
-    roi_heart = ((xx_p - 8.0) ** 2 + (yy_p - 36.0) ** 2) <= (10.0 ** 2)
-    roi_right_lung = ((xx_p + 64.0) ** 2 + (yy_p - 8.0) ** 2) <= (22.0 ** 2)
+    roi_heart = ((xx_p + 8.0) ** 2 + (yy_p - 36.0) ** 2) <= (10.0 ** 2)
+    roi_right_lung = ((xx_p - 64.0) ** 2 + (yy_p - 8.0) ** 2) <= (22.0 ** 2)
     roi_spine = ((xx_p - 0.0) ** 2 + (yy_p + 68.0) ** 2) <= (8.0 ** 2)
 
     heart_hu = float(np.mean(fbp_ref.hu_slices[0][roi_heart]))

@@ -11,7 +11,7 @@ from unittest import mock
 import numpy as np
 
 from highpitchct.cli import main as cli_main
-from highpitchct.ctpd_reader import read_projection_stack, scan_projection_series
+from highpitchct.ctpd_reader import read_single_projection, scan_projection_series
 from highpitchct.phantom import (
     Ellipsoid3D,
     build_thorax_phantom,
@@ -259,17 +259,19 @@ class TestStage3ParkerAndFBP(unittest.TestCase):
         )
         self.assertGreaterEqual(ref_metrics["ssim"], 0.88)
 
-        # Verify radiological supine coordinates: Row 0 = +y (Sternum), Row H-1 = -y (Spine)
+        # Verify radiological supine coordinates:
+        #   Row 0 = +y (Anterior Sternum), Row H-1 = -y (Posterior Spine)
+        #   Col 0 = +x (Patient Right / Right Lung), Col W-1 = -x (Patient Left / Heart)
         self.assertGreater(float(fbp_ref.y_mm[0]), 0.0)
         self.assertLess(float(fbp_ref.y_mm[-1]), 0.0)
-        self.assertLess(float(fbp_ref.x_mm[0]), 0.0)
-        self.assertGreater(float(fbp_ref.x_mm[-1]), 0.0)
+        self.assertGreater(float(fbp_ref.x_mm[0]), 0.0)
+        self.assertLess(float(fbp_ref.x_mm[-1]), 0.0)
 
         yy, xx = np.meshgrid(fbp_ref.y_mm, fbp_ref.x_mm, indexing="ij")
-        roi_heart = ((xx - 8.0) ** 2 + (yy - 36.0) ** 2) <= 10.0 ** 2
+        roi_heart = ((xx + 8.0) ** 2 + (yy - 36.0) ** 2) <= 10.0 ** 2
         heart_hu = float(np.mean(fbp_ref.hu_slices[0][roi_heart]))
         gt_heart_hu = float(np.mean(gt[roi_heart]))
-        rlung_hu = float(np.mean(fbp_ref.hu_slices[0][((xx + 64.0) ** 2 + (yy - 8.0) ** 2) <= 22.0 ** 2]))
+        rlung_hu = float(np.mean(fbp_ref.hu_slices[0][((xx - 64.0) ** 2 + (yy - 8.0) ** 2) <= 22.0 ** 2]))
         spine_hu = float(np.mean(fbp_ref.hu_slices[0][((xx - 0.0) ** 2 + (yy + 68.0) ** 2) <= 8.0 ** 2]))
         self.assertTrue(40.0 <= heart_hu <= 75.0, msg=f"Unexpected heart HU={heart_hu} (GT={gt_heart_hu})")
         self.assertLess(abs(heart_hu - gt_heart_hu), 10.0)
@@ -401,11 +403,17 @@ class TestStage3StreamingAndCLI(unittest.TestCase):
             proj_dir = (
                 root / "raw" / "tcia" / "case_C012" / "projection_full" / geom.series_instance_uid
             )
-            write_synthetic_ctpd_series(proj_dir, geom, proj)
+            write_synthetic_ctpd_series(proj_dir, geom, proj, patient_id="C012")
 
             # Verify streaming matches in-memory FBP from the same DICOM files bit-for-bit
             geom_dcm, files_dcm = scan_projection_series(proj_dir, workers=2)
-            proj_dcm = read_projection_stack(files_dcm, geometry=geom_dcm, workers=2)
+            proj_dcm = np.stack(
+                [
+                    read_single_projection(f, expected_rows=geom.n_rows, expected_cols=geom.n_cols)
+                    for f in files_dcm
+                ],
+                axis=0,
+            )
             flat_m, valid_m = rebin_curved_to_flat(proj_dcm, geom_dcm)
             ssrb_mem = rebin_helical_ssrb(flat_m, valid_m, geom_dcm, [-6.0, 0.0, 6.0])
             fbp_mem = reconstruct_fanbeam_fbp(

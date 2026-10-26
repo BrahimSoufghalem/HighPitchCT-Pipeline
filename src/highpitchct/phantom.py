@@ -48,9 +48,11 @@ class Ellipsoid3D:
 def build_thorax_phantom(axial_scale: float = 1.0) -> list[Ellipsoid3D]:
     """Build an asymmetric 3D thorax phantom centered around (0, 0, 0) [mm].
 
-    Patient coordinate convention (supine, DICOM-CT-PD Manual Fig. 5):
-      +x = patient's left, -x = patient's right
-      +y = anterior (sternum), -y = posterior (spine)
+    Patient coordinate convention (supine, DICOM-CT-PD Manual Fig. 5 left-handed system):
+      +x = patient's right (liver / right lung, displayed on Viewer's Left Col 0)
+      -x = patient's left (heart / left lung, displayed on Viewer's Right Col W-1)
+      +y = anterior (sternum, displayed at Top Row 0)
+      -y = posterior (spine, displayed at Bottom Row H-1)
       +z = cranial (apical), -z = caudal (basal)
 
     Internal structures inside the soft-tissue trunk (+20 HU, so delta_hu=+1020 over -1000 HU air)
@@ -70,29 +72,29 @@ def build_thorax_phantom(axial_scale: float = 1.0) -> list[Ellipsoid3D]:
             delta_hu=1020.0,
             yaw_rad=0.0,
         ),
-        # Right lung (-x): lowers soft tissue (+20 HU) -> lung parenchyma (-750 HU)
+        # Right lung (+x, Patient Right / Viewer's Left): lowers soft tissue (+20 HU) -> (-750 HU)
         Ellipsoid3D(
             name="right_lung",
-            center_xyz_mm=(-64.0, 8.0, 4.0 * s),
+            center_xyz_mm=(64.0, 8.0, 4.0 * s),
             semi_axes_xyz_mm=(52.0, 68.0, 95.0 * s),
             delta_hu=-770.0,
-            yaw_rad=-0.12,
+            yaw_rad=0.12,
         ),
-        # Left lung (+x): smaller to accommodate anterior-left heart -> (-750 HU)
+        # Left lung (-x, Patient Left / Viewer's Right): smaller to accommodate heart -> (-750 HU)
         Ellipsoid3D(
             name="left_lung",
-            center_xyz_mm=(68.0, 2.0, 6.0 * s),
+            center_xyz_mm=(-68.0, 2.0, 6.0 * s),
             semi_axes_xyz_mm=(45.0, 64.0, 90.0 * s),
             delta_hu=-770.0,
-            yaw_rad=0.14,
+            yaw_rad=-0.14,
         ),
-        # Heart (anterior-left, caudal bias): raises (+20 HU) -> blood/myocardium (+55 HU)
+        # Heart (anterior-left at -x, caudal bias): raises (+20 HU) -> blood/myocardium (+55 HU)
         Ellipsoid3D(
             name="heart",
-            center_xyz_mm=(16.0, 32.0, -18.0 * s),
+            center_xyz_mm=(-16.0, 32.0, -18.0 * s),
             semi_axes_xyz_mm=(34.0, 38.0, 46.0 * s),
             delta_hu=35.0,
-            yaw_rad=0.20,
+            yaw_rad=-0.20,
         ),
         # Posterior spine cortical bone (-y): raises (+20 HU) -> cortical bone (+820 HU)
         Ellipsoid3D(
@@ -110,10 +112,10 @@ def build_thorax_phantom(axial_scale: float = 1.0) -> list[Ellipsoid3D]:
             delta_hu=-640.0,
             yaw_rad=0.0,
         ),
-        # Descending aorta (posterior-left): raises (+20 HU) -> contrast blood (+140 HU)
+        # Descending aorta (posterior-left at -x): raises (+20 HU) -> contrast blood (+140 HU)
         Ellipsoid3D(
             name="descending_aorta",
-            center_xyz_mm=(18.0, -40.0, -8.0 * s),
+            center_xyz_mm=(-18.0, -40.0, -8.0 * s),
             semi_axes_xyz_mm=(12.0, 12.0, 105.0 * s),
             delta_hu=120.0,
             yaw_rad=0.0,
@@ -126,18 +128,18 @@ def build_thorax_phantom(axial_scale: float = 1.0) -> list[Ellipsoid3D]:
             delta_hu=500.0,
             yaw_rad=0.0,
         ),
-        # Right apical pulmonary nodule (cranial +z, right -x) inside right_lung: (-750 -> +40 HU)
+        # Right apical pulmonary nodule (cranial +z, right +x) inside right_lung: (-750 -> +40 HU)
         Ellipsoid3D(
             name="right_apical_nodule",
-            center_xyz_mm=(-58.0, 18.0, 42.0 * s),
+            center_xyz_mm=(58.0, 18.0, 42.0 * s),
             semi_axes_xyz_mm=(9.0, 9.0, 9.0 * max(0.5, s)),
             delta_hu=790.0,
             yaw_rad=0.0,
         ),
-        # Left basal high-density lesion (caudal -z, left +x) inside left_lung: (-750 -> +90 HU)
+        # Left basal high-density lesion (caudal -z, left -x) inside left_lung: (-750 -> +90 HU)
         Ellipsoid3D(
             name="left_basal_lesion",
-            center_xyz_mm=(66.0, -14.0, -36.0 * s),
+            center_xyz_mm=(-66.0, -14.0, -36.0 * s),
             semi_axes_xyz_mm=(12.0, 10.0, 11.0 * max(0.5, s)),
             delta_hu=840.0,
             yaw_rad=0.0,
@@ -217,7 +219,7 @@ def voxelize_phantom_slices_radiological(
     center_xy_mm: tuple[float, float] = (0.0, 0.0),
     water_mu_mm_inv: float = 0.0192,
 ) -> dict[str, np.ndarray]:
-    """Evaluate exact 3D phantom slices on radiological (Row 0 = +y Anterior, Col 0 = -x Right) grid."""
+    """Evaluate exact 3D phantom slices on radiological (Row 0 = +y Anterior, Col 0 = +x Right) grid."""
     n_xy = int(image_size)
     if n_xy < 2:
         raise ValueError(f"image_size must be >= 2, got {image_size}")
@@ -227,7 +229,7 @@ def voxelize_phantom_slices_radiological(
     z_arr = np.asarray(z_slices_mm, dtype=np.float64).reshape(-1)
     d_xy = float(fov_mm) / float(n_xy)
     half_idx = 0.5 * (n_xy - 1.0)
-    x_mm = float(center_xy_mm[0]) + (np.arange(n_xy, dtype=np.float64) - half_idx) * d_xy
+    x_mm = float(center_xy_mm[0]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
     y_mm = float(center_xy_mm[1]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
 
     mu_slices = np.zeros((z_arr.size, n_xy, n_xy), dtype=np.float32)

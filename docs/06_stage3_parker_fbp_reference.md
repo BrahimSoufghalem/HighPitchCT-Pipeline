@@ -17,15 +17,15 @@
 لهذا السبب يعتمد مشروعنا (وفق سجل القرار المعماري [`ADR-0001`](./decisions/0001-reference-reconstruction.md)) بناء **$x_{\text{reference}}$** من مساقط الجرعة الكاملة عند الـ `Pitch` الأصلي المنخفض نسبيًا ($\approx 0.90$ في `C012` حيث نسبة القياس في `Short-Scan` تبلغ **`100.00%`** دون أي شعاع مفقود!) باستخدام المحرّك الفيزيائي الدقيق نفسه (`SSRB + Exact Parker + Spatial Ram-Lak/Hann FBP`)، بينما تُحفظ صور `Siemens` المنشورة جنبًا إلى جنب في لوحات المقارنة البصرية (`Visual QA`) مرجعًا تشريحيًا خارجيًا مستقلًا.
 
 ### اتفاقية التوجيه الإشعاعي السريري (`Supine Radiological Pixel Grid`)
-في جملة الجانتري لملفات `DICOM-CT-PD` لمريض مستلقٍ على ظهره (`HFS — Head-First Supine`):
-- المحور $+x$ يتجه إلى **يسار المريض (`Patient Left`)**، والمحور $-x$ إلى **يمين المريض (`Patient Right`)**.
+في جملة الإحداثيات اليسرى (`Left-Handed Coordinate System`) للشكل 5 من دليل `DICOM-CT-PD User Manual v4` (المرسومة من جهة قاعدة الطاولة باتجاه الجانتري $+z$):
+- المحور $+x$ يتجه إلى **يمين المريض (`Patient Right` — الكبد والرئة اليمنى)**، والمحور $-x$ إلى **يسار المريض (`Patient Left` — القلب والرئة اليسرى)**.
 - المحور $+y$ يتجه إلى الأعلى (**الساعة 12 — عظم القص الأمامي `Anterior Sternum`**)، والمحور $-y$ إلى الأسفل (**الساعة 6 — العمود الفقري الخلفي `Posterior Spine`**).
 
-ولكي تظهر جميع مقاطعنا المقطعية بالتوجيه الطبي القياسي العالمي (عظم القص في أعلى الصورة، العمود الفقري في أسفلها، الرئة اليمنى على يسار المشاهد، والقلب مائل لليسار التشريحي أي يمين المشاهد)، تُعرّف الدالة [`image_xy_axes_mm`](../src/highpitchct/recon_fbp.py) شبكة البكسلات `[iy, ix]` بحجم $N_{xy} \times N_{xy}$ وعرض ساحة رؤية $\text{FOV}$ كالتالي:
+ولكي تظهر جميع مقاطعنا المقطعية بالتوجيه الطبي الإشعاعي القياسي العالمي (`Radiological View`: النظر من قدمي المريض نحو رأسه، بحيث يقع عظم القص في أعلى الصورة `Row 0`، العمود الفقري في أسفلها `Row N_xy-1`، يمين المريض/الكبد على يسار المشاهد `Col 0`، ويسار المريض/القلب على يمين المشاهد `Col N_xy-1`، مطابقًا تمامًا لصور `DICOM CT Image Storage` المنشورة)، تُعرّف [`reconstruct_fanbeam_fbp`](../src/highpitchct/recon_fbp.py) شبكة البكسلات `[iy, ix]` بحجم $N_{xy} \times N_{xy}$ وعرض ساحة رؤية $\text{FOV}$ كالتالي:
 
-$$d_{xy} = \frac{\text{FOV}}{N_{xy}}, \qquad x_{\text{ix}} = x_c + \left(\text{ix} - \frac{N_{xy} - 1}{2}\right) d_{xy} \quad (\text{Col } 0 = -x \rightarrow \text{Col } N_{xy}-1 = +x)$$
+$$d_{xy} = \frac{\text{FOV}}{N_{xy}}, \qquad x_{\text{ix}} = x_c + \left(\frac{N_{xy} - 1}{2} - \text{ix}\right) d_{xy} \quad (\text{Col } 0 = +x\text{ [Patient Right]} \rightarrow \text{Col } N_{xy}-1 = -x\text{ [Patient Left]})$$
 
-$$y_{\text{iy}} = y_c + \left(\frac{N_{xy} - 1}{2} - \text{iy}\right) d_{xy} \quad (\text{Row } 0 = +y \rightarrow \text{Row } N_{xy}-1 = -y)$$
+$$y_{\text{iy}} = y_c + \left(\frac{N_{xy} - 1}{2} - \text{iy}\right) d_{xy} \quad (\text{Row } 0 = +y\text{ [Anterior]} \rightarrow \text{Row } N_{xy}-1 = -y\text{ [Posterior]})$$
 
 مع قناع دائري صريح لساحة الرؤية الفيزيائية للجهاز (`Scanner FOV`):
 
@@ -41,21 +41,23 @@ $$R_{\text{FOV}} = \rho_0 \sin\gamma_{\max}, \qquad \text{fov\_mask}[\text{iy}, 
 يُعيد `Stage 2` كائن [`SSRBResult`](../src/highpitchct/rebinning.py) متضمّنًا `sinograms` (حيث كل نقطة غير مقاسة تساوي `0.0`) والقناع المنطقي الصارم `measured_mask`. في المرحلة السابعة (`Stage 7`)، ستحتاج شبكة `Sinogram Residual U-Net` إلى هذا القناع الأصلي ذاته لتعرف بدقة أين تقع الفجوات الفيزيائية الحقيقية. لذلك تلتزم الدالة [`extrapolate_sinogram`](../src/highpitchct/recon_fbp.py) بقاعدة صارمة مفحوصة آليًا في الاختبارات: **لا يُعدَّل `SSRBResult.measured_mask` إطلاقًا**، بل يُنسخ إلى `PreparedSinogram.original_measured_mask` ويُبنى فوقه سينوغرام مكتمل `completed_sinograms` لأغراض `FBP`.
 
 ### 2.2 لماذا لا يكفي وضع الأصفار مباشرةً في `Parker + FBP` عند الـ `High-Pitch`؟
-ترجيح `Parker` يفترض أن الشعاع $(\tilde{\beta}, \alpha_m)$ ومرافقه الهندسي $(\tilde{\beta} + \pi + 2\alpha_m, -\alpha_m)$ يحملان التكامل الخطي نفسه $g$، فيضرب الأول في $w_1$ والثاني في $w_2$ حيث $w_1 + w_2 = 1$. إذا سقط الشعاع الأول في فجوة `High-Pitch` وبقي صفرًا ($g_1 = 0$) بينما قيس مرافقه ($g_2 = g$)، فإن المجموع المرجّح يصبح:
+ترجيح `Parker` يفترض أن الشعاع $(\tilde{\beta}, \alpha_m)$ ومرافقه الهندسي $(\tilde{\beta} + 2\alpha_m \pm \pi, -\alpha_m)$ يحملان التكامل الخطي نفسه $g$، فيضرب الأول في $w_1$ والثاني في $w_2$ حيث $w_1 + w_2 = 1$. إذا سقط الشعاع الأول في فجوة `High-Pitch` وبقي صفرًا ($g_1 = 0$) بينما قيس مرافقه ($g_2 = g$)، فإن المجموع المرجّح يصبح:
 
 $$w_1 \cdot 0 + w_2 \cdot g = w_2 g < g$$
 
 أي هبوط كاذب في التوهين، يتلوه قفز حاد عند حافة الفجوة يحوّله مرشح `Ram-Lak` التفاضلي إلى **خطوط تشوه شعاعية عنيفة (`Severe Missing-Wedge Streaks`)** تخترق كامل الرئة والقلب!
 
 ### 2.3 الاستكمال الفيزيائي بالأشعة المرافقة متبوعًا بالدمج الاتجاهي (`inpaint_mode="conjugate_feather"`)
-تنفّذ الدالة [`extrapolate_sinogram`](../src/highpitchct/recon_fbp.py) ثلاث خطوات متتالية في وضع `conjugate_feather` الافتراضي:
+تنفّذ الدالة [`extrapolate_sinogram`](../src/highpitchct/recon_fbp.py) أربع خطوات متتالية في وضع `conjugate_feather` الافتراضي:
 
+0. **التمهيد المسبق للأعمدة الحدية ذات إزاحة ربع عنصر الكاشف (`Quarter-Offset Border Column Pre-fill`):**
+   تُملأ أي أعمدة طرفية غير مقاسة بالكامل من أقرب عمود جارٍ مقاس عند الزوايا المقاسة نفسها قبل البحث عن الأشعة المرافقة.
 1. **الإنقاذ الفيزيائي الدقيق من الشعاع المرافق المقاس (`Exact Planar Conjugate-Ray Fill`):**
-   لكل بكسل مفقود $(\beta_k, u_m)$ في إحدى منطقتي التداخل الزاوي (`Overscan Zones`)، نحسب إحداثيات شعاعه المرافق المستوي تمامًا:
-   $$\beta_{\text{conj}} = \beta_k \pm (\pi + 2\alpha_m), \qquad u_{\text{conj}} = -u_m \quad \bigl(\alpha_m = \arctan(u_m / d_0)\bigr)$$
-   ونتحقق بشرط صارم: **لا يُقبل الشعاع المرافق إلا إذا وقع داخل شبكة الزوايا والأعمدة وكانت جميع الجيران الأربعة للاستيفاء الثنائي في `measured_mask` مقاسةً فعليًا (`True`)!** عندها يُملأ البكسل المفقود بقيمة قياس حقيقي لنفس المستقيم الأفقي عبر جسم المريض، ويُسجَّل في `conjugate_filled_mask`.
+   لكل بكسل مفقود $(\beta_k, u_m)$ في إحدى منطقتي التداخل الزاوي (`Overscan Zones`)، نحسب إحداثيات شعاعه المرافق المستوي تمامًا (بما أن زاوية الشعاع الكلية هي $\theta = \beta_k + \alpha_m$ وعند عكس الاتجاه بـ $\pm\pi$ يصبح $\alpha' = -\alpha_m$ فإن $\beta' - \alpha_m = \beta_k + \alpha_m \pm \pi$، أي أن إشارة $+2\alpha_m$ موجبة دائمًا لكلا الاتجاهين $\pm\pi$!):
+   $$\beta_{\text{conj}} = \beta_k + 2\alpha_m \pm \pi, \qquad u_{\text{conj}} = -u_m \quad \bigl(\alpha_m = \arctan(u_m / d_0)\bigr)$$
+   ونتحقق بشرط صارم: **لا يُقبل الشعاع المرافق إلا إذا وقع داخل شبكة الزوايا والأعمدة وكانت جميع الجيران الأربعة للاستيفاء الثنائي مقاسةً فعليًا (`True`)!** عندها يُملأ البكسل المفقود بقيمة قياس حقيقي لنفس المستقيم الأفقي عبر جسم المريض، ويُسجَّل في `conjugate_filled_mask`.
 2. **الدمج السلس للزوايا والأعمدة المتبقية (`Directional Angular + Transverse Feathering`):**
-   للفجوات المتبقية التي غاب فيها الشعاع ومرافقه معًا (عند `pitch` مرتفع جدًا)، يُطبَّق استيفاء خطي دوري أو محدود عبر الزاوية $\beta$ مدموجًا باستيفاء جانبي عبر $u$ لمنع أي انقطاع خطوي (`Step Discontinuity`) قبل الفلترة.
+   للفجوات المتبقية التي غاب فيها الشعاع ومرافقه معًا (عند `pitch` مرتفع جدًا)، يُطبَّق استيفاء خطي عبر الزاوية $\beta$ متبوعًا بتنعيم ثنائي البعد `(k, u)` داخل المنطقة غير المقاسة أصلاً (`~mask_orig`) حصريًا (مع بقاء جميع القياسات الأصلية `mask_orig` محمية بنسبة `100%`) لمنع أي انقطاع قطري (`Diagonal Step Discontinuity`) قبل الفلترة بمرشح `Ram-Lak`.
 3. **التمديد الجانبي بجيب التمام المرفوع (`Raised-Cosine Lateral Truncation Roll-off`):**
    داخل [`filter_weighted_sinogram_2d`](../src/highpitchct/recon_fbp.py)، وقبل تطبيق `FFT`، تُمدَّد حافتا الكاشف اليمنى واليسرى بعدد `lateral_pad_cols = 96` عمودًا تتناقص فيها القيمة بنعومة عبر $\frac{1}{2}\bigl(1 + \cos(\pi t)\bigr)$ من قيمة آخر عمود مقاس إلى `0.0`، تليها أصفار حتى قوة العدد `2` التالية (`next_pow2`) لمنع الالتفاف الدوري (`Circular Convolution Aliasing`) ومنع تقعّر الأطراف (`Truncation Cupping`).
 
