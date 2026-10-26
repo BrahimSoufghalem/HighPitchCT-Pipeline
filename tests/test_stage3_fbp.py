@@ -11,6 +11,7 @@ from unittest import mock
 import numpy as np
 
 from highpitchct.cli import main as cli_main
+from highpitchct.ctpd_reader import read_projection_stack, scan_projection_series
 from highpitchct.phantom import (
     Ellipsoid3D,
     build_thorax_phantom,
@@ -402,13 +403,15 @@ class TestStage3StreamingAndCLI(unittest.TestCase):
             )
             write_synthetic_ctpd_series(proj_dir, geom, proj)
 
-            # Verify streaming matches in-memory FBP bit-for-bit
-            flat_m, valid_m = rebin_curved_to_flat(proj, geom)
-            ssrb_mem = rebin_helical_ssrb(flat_m, valid_m, geom, [-6.0, 0.0, 6.0])
+            # Verify streaming matches in-memory FBP from the same DICOM files bit-for-bit
+            geom_dcm, files_dcm = scan_projection_series(proj_dir, workers=2)
+            proj_dcm = read_projection_stack(files_dcm, geometry=geom_dcm, workers=2)
+            flat_m, valid_m = rebin_curved_to_flat(proj_dcm, geom_dcm)
+            ssrb_mem = rebin_helical_ssrb(flat_m, valid_m, geom_dcm, [-6.0, 0.0, 6.0])
             fbp_mem = reconstruct_fanbeam_fbp(
                 ssrb_mem,
                 image_size=128,
-                water_mu_mm_inv=geom.water_mu_mm_inv,
+                water_mu_mm_inv=geom_dcm.water_mu_mm_inv,
                 filter_name="hann",
             )
             ssrb_str, fbp_str = reconstruct_series_reference_streaming(
@@ -419,10 +422,28 @@ class TestStage3StreamingAndCLI(unittest.TestCase):
                 workers=2,
             )
             self.assertTrue(np.array_equal(ssrb_mem.measured_mask, ssrb_str.measured_mask))
-            np.testing.assert_allclose(fbp_mem.hu_slices, fbp_str.hu_slices, atol=1e-4, rtol=1e-5)
+            np.testing.assert_allclose(fbp_mem.hu_slices, fbp_str.hu_slices, atol=1e-5, rtol=1e-5)
 
-            # Run CLI `hpct stage3-recon --case-id C012 --run-phantom-check`
-            npz_out = root / "manifests" / "c012_stage3_ref.npz"
+            # Also verify uint16 DICOM quantization vs unquantized float32 projections is < 0.10 HU
+            flat_unq, valid_unq = rebin_curved_to_flat(proj, geom)
+            ssrb_unq = rebin_helical_ssrb(flat_unq, valid_unq, geom, [-6.0, 0.0, 6.0])
+            fbp_unq = reconstruct_fanbeam_fbp(
+                ssrb_unq,
+                image_size=128,
+                water_mu_mm_inv=geom.water_mu_mm_inv,
+                filter_name="hann",
+            )
+            np.testing.assert_allclose(fbp_unq.hu_slices, fbp_str.hu_slices, atol=0.10, rtol=1e-3)
+
+            # Verify CLI `hpct index-dicom` alias writes both series_inventory.csv and dicom_series_index.csv
+            rc_idx = cli_main(
+                ["index-dicom", "--data-root", str(root), "--workers", "2", "--no-progress"]
+            )
+            self.assertEqual(rc_idx, 0)
+            self.assertTrue((root / "manifests" / "series_inventory.csv").is_file())
+            self.assertTrue((root / "manifests" / "dicom_series_index.csv").is_file())
+
+            # Run CLI `hpct stage3-recon --case-id C012 --filter-name hann --save-reference-npz --run-phantom-check`
             rc = cli_main(
                 [
                     "stage3-recon",
@@ -434,8 +455,9 @@ class TestStage3StreamingAndCLI(unittest.TestCase):
                     "3",
                     "--image-size",
                     "128",
-                    "--recon-out",
-                    str(npz_out),
+                    "--filter-name",
+                    "hann",
+                    "--save-reference-npz",
                     "--run-phantom-check",
                     "--workers",
                     "2",
@@ -448,7 +470,8 @@ class TestStage3StreamingAndCLI(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertTrue(report["overall_pass"])
             self.assertEqual(report["reconstructed_series_count"], 1)
-            self.assertTrue(npz_out.is_file())
+            auto_npz = root / "manifests" / "stage3_case_C012_x_reference.npz"
+            self.assertTrue(auto_npz.is_file())
 
             p_real = Path(report["reconstructed_series"][0]["visual_qa_png"])
             p_phan = Path(report["synthetic_phantom_fbp_check"]["visual_qa_png"])

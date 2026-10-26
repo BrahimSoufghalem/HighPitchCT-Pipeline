@@ -650,6 +650,7 @@ def _parser() -> argparse.ArgumentParser:
 
     index = sub.add_parser(
         "index",
+        aliases=["index-dicom"],
         help="Create header-only DICOM & DICOM-CT-PD v4 inventory and series audit",
     )
     index.add_argument("--data-root", help="Writable root where manifests/ will be saved")
@@ -763,6 +764,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage3.add_argument(
         "--filter",
+        "--filter-name",
         dest="filter_name",
         choices=["ramp", "shepp_logan", "cosine", "hamming", "hann"],
         default="hann",
@@ -795,6 +797,11 @@ def _parser() -> argparse.ArgumentParser:
     stage3.add_argument(
         "--recon-out",
         help="Optional compressed .npz path to save reconstructed mu_slices, hu_slices, and coordinate grids",
+    )
+    stage3.add_argument(
+        "--save-reference-npz",
+        action="store_true",
+        help="Automatically save reconstructed x_reference slices to <data-root>/manifests/stage3_<case_id>_x_reference.npz",
     )
     stage3.add_argument(
         "--run-phantom-check",
@@ -902,7 +909,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if args.command == "index":
+    if args.command in ("index", "index-dicom"):
         if args.workers < 1:
             raise SystemExit("--workers must be at least 1")
         env_prof = resolve_environment_profile(data_root=args.data_root)
@@ -1024,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 1 (v0.5.0)",
+            "stage": "Stage 1 (v0.6.0)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "audited_series_count": len(audited_series),
@@ -1455,11 +1462,16 @@ def main(argv: list[str] | None = None) -> int:
                 "visual_qa_png": str(qa_png),
             }
 
+            target_npz_out: Path | None = None
             if args.recon_out and idx_t == 0:
-                r_out = Path(args.recon_out).expanduser().resolve()
-                r_out.parent.mkdir(parents=True, exist_ok=True)
+                target_npz_out = Path(args.recon_out).expanduser().resolve()
+            elif getattr(args, "save_reference_npz", False):
+                target_npz_out = env_prof.data_root / "manifests" / f"stage3_{cid}_x_reference.npz"
+
+            if target_npz_out is not None:
+                target_npz_out.parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(
-                    r_out,
+                    target_npz_out,
                     mu_slices=fbp_ref.mu_slices,
                     hu_slices=fbp_ref.hu_slices,
                     fov_mask=fbp_ref.fov_mask,
@@ -1471,7 +1483,7 @@ def main(argv: list[str] | None = None) -> int:
                     water_mu_mm_inv=np.array(fbp_ref.water_mu_mm_inv, dtype=np.float64),
                     filter_name=np.array(fbp_ref.filter_name, dtype=np.str_),
                 )
-                entry["recon_npz"] = str(r_out)
+                entry["recon_npz"] = str(target_npz_out)
 
             reconstructed_series.append(entry)
 

@@ -532,10 +532,12 @@ def index_dicom_tree(
         srow["validation_notes"] = " | ".join(notes)
         series_rows.append(srow)
 
-    with series_csv.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=_SERIES_FIELDS)
-        writer.writeheader()
-        writer.writerows(series_rows)
+    series_alias_csv = root / "manifests" / "dicom_series_index.csv"
+    for target_s_csv in (series_csv, series_alias_csv):
+        with target_s_csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=_SERIES_FIELDS)
+            writer.writeheader()
+            writer.writerows(series_rows)
 
     errors = sum(bool(row["read_error"]) for row in file_rows)
     elapsed_s = round(max(time.monotonic() - t_start, 1e-4), 3)

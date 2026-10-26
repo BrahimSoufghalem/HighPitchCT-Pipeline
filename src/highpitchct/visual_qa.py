@@ -125,6 +125,10 @@ def _compose_grid_png_stdlib(
 def _has_matplotlib() -> bool:
     import os
     import tempfile
+    import warnings
+
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"pyparsing.*")
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"matplotlib.*")
 
     if "MPLCONFIGDIR" not in os.environ:
         default_cfg = Path.home() / ".config" / "matplotlib"
@@ -133,9 +137,11 @@ def _has_matplotlib() -> bool:
             mpl_tmp.mkdir(parents=True, exist_ok=True)
             os.environ["MPLCONFIGDIR"] = str(mpl_tmp)
     try:
-        import matplotlib  # noqa: F401
-        from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: F401
-        from matplotlib.figure import Figure  # noqa: F401
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            import matplotlib  # noqa: F401
+            from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: F401
+            from matplotlib.figure import Figure  # noqa: F401
 
         return True
     except ImportError:
