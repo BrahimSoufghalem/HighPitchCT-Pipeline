@@ -172,7 +172,7 @@ def save_stage1_phantom_visual_qa(
 
     nz, ny, _ = hu_volume.shape
     nv, nr, _ = projections.shape
-    axial_hu = hu_volume[nz // 2]
+    axial_hu = hu_volume[nz // 2][::-1, :]  # Radiological supine: top = +y Anterior
     coronal_hu = hu_volume[:, ny // 2, :][::-1, :]  # +z at top
     mid_proj = projections[nv // 2]
     mid_sino = projections[:, nr // 2, :]
@@ -204,7 +204,7 @@ def save_stage1_phantom_visual_qa(
     im1 = ax1.imshow(axial_hu, cmap="gray", vmin=-1000.0, vmax=600.0, aspect="equal")
     ax1.set_title("Ground-Truth Axial Slice (z = mid, [-1000, 600] HU)")
     ax1.set_xlabel("x index (+x = Patient Left)")
-    ax1.set_ylabel("y index")
+    ax1.set_ylabel("y index (top = +y Anterior)")
     fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
     ax2 = fig.add_subplot(2, 2, 2)
@@ -566,3 +566,276 @@ def save_stage2_real_ssrb_visual_qa(
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     fig.savefig(target, format="png")
     return target
+
+
+def save_stage3_phantom_fbp_visual_qa(
+    out_path: str | Path,
+    *,
+    gt_hu: np.ndarray,
+    ref_fbp_hu: np.ndarray,
+    high_pitch_raw_fbp_hu: np.ndarray,
+    high_pitch_inpaint_fbp_hu: np.ndarray,
+    fov_mask: np.ndarray,
+    fov_mm: float,
+    z_slice_mm: float,
+    low_pitch: float,
+    high_pitch: float,
+    ref_metrics: dict[str, float],
+    hp_raw_metrics: dict[str, float],
+    hp_inpaint_metrics: dict[str, float],
+) -> Path:
+    """Save 6-panel (2x3) Stage 3 Synthetic Phantom Ground Truth vs Parker+FBP Visual QA PNG."""
+    target = Path(out_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fmask = np.asarray(fov_mask, dtype=bool)
+    err_ref = np.where(fmask, np.abs(ref_fbp_hu - gt_hu), 0.0)
+    err_hp = np.where(fmask, np.abs(high_pitch_inpaint_fbp_hu - gt_hu), 0.0)
+
+    if not _has_matplotlib():
+        return _compose_grid_png_stdlib(
+            target,
+            [
+                _panel_to_rgb(gt_hu, vmin=-1000.0, vmax=600.0),
+                _panel_to_rgb(ref_fbp_hu, vmin=-1000.0, vmax=600.0),
+                _panel_to_rgb(err_ref, vmin=0.0, vmax=150.0, heat=True),
+                _panel_to_rgb(high_pitch_raw_fbp_hu, vmin=-1000.0, vmax=600.0),
+                _panel_to_rgb(high_pitch_inpaint_fbp_hu, vmin=-1000.0, vmax=600.0),
+                _panel_to_rgb(err_hp, vmin=0.0, vmax=150.0, heat=True),
+            ],
+            ncols=3,
+            tile_h=280,
+            tile_w=280,
+        )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    half_fov = 0.5 * float(fov_mm)
+    extent = [-half_fov, half_fov, -half_fov, half_fov]
+
+    fig = Figure(figsize=(17.0, 10.5), dpi=130)
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        f"Stage 3 Visual QA — Exact 3D Phantom GT vs Helical FFSZ SSRB + Parker + FBP (z = {z_slice_mm:.1f} mm)",
+        fontsize=13,
+        fontweight="bold",
+    )
+
+    ax1 = fig.add_subplot(2, 3, 1)
+    im1 = ax1.imshow(gt_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal")
+    ax1.set_title("A. Exact 3D Phantom Ground Truth [-1000, 600] HU")
+    ax1.set_xlabel("x [mm] (+x = Patient Left)")
+    ax1.set_ylabel("y [mm] (+y = Anterior Sternum)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    ax2 = fig.add_subplot(2, 3, 2)
+    im2 = ax2.imshow(
+        ref_fbp_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal"
+    )
+    ax2.set_title(
+        f"B. Reference FBP (p={low_pitch:.2f}, RMSE={ref_metrics['rmse_hu']:.1f} HU, SSIM={ref_metrics['ssim']:.3f})"
+    )
+    ax2.set_xlabel("x [mm]")
+    ax2.set_ylabel("y [mm]")
+    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    ax3 = fig.add_subplot(2, 3, 3)
+    im3 = ax3.imshow(err_ref, cmap="magma", vmin=0.0, vmax=150.0, extent=extent, aspect="equal")
+    ax3.set_title(
+        f"C. |Ref FBP - GT| [HU] (MAE={ref_metrics['mae_hu']:.1f} HU, PSNR={ref_metrics['psnr_db']:.1f} dB)"
+    )
+    ax3.set_xlabel("x [mm]")
+    ax3.set_ylabel("y [mm]")
+    fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+    ax4 = fig.add_subplot(2, 3, 4)
+    im4 = ax4.imshow(
+        high_pitch_raw_fbp_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal"
+    )
+    ax4.set_title(
+        f"D. High-Pitch={high_pitch:.2f} FBP WITHOUT Wedge Fill (RMSE={hp_raw_metrics['rmse_hu']:.1f} HU)"
+    )
+    ax4.set_xlabel("x [mm] (Severe Missing-Wedge Streaks)")
+    ax4.set_ylabel("y [mm]")
+    fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+
+    ax5 = fig.add_subplot(2, 3, 5)
+    im5 = ax5.imshow(
+        high_pitch_inpaint_fbp_hu,
+        cmap="gray",
+        vmin=-1000.0,
+        vmax=600.0,
+        extent=extent,
+        aspect="equal",
+    )
+    ax5.set_title(
+        f"E. High-Pitch={high_pitch:.2f} FBP + Conjugate/Feather Fill (RMSE={hp_inpaint_metrics['rmse_hu']:.1f} HU)"
+    )
+    ax5.set_xlabel("x [mm] (Streaks Suppressed; Cone-Beam Residual Remains)")
+    ax5.set_ylabel("y [mm]")
+    fig.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
+
+    ax6 = fig.add_subplot(2, 3, 6)
+    mid_idx = gt_hu.shape[0] // 2
+    x_axis = np.linspace(-half_fov, half_fov, gt_hu.shape[1])
+    ax6.plot(x_axis, gt_hu[mid_idx, :], label="Exact GT (y=0)", color="#111111", linewidth=1.8)
+    ax6.plot(
+        x_axis,
+        ref_fbp_hu[mid_idx, :],
+        label=f"Ref FBP (p={low_pitch:.2f})",
+        color="#0077bb",
+        linewidth=1.3,
+    )
+    ax6.plot(
+        x_axis,
+        high_pitch_inpaint_fbp_hu[mid_idx, :],
+        label=f"HP FBP + Fill (p={high_pitch:.2f})",
+        color="#ee7733",
+        linewidth=1.1,
+        alpha=0.9,
+    )
+    ax6.set_ylim(-1080.0, 900.0)
+    ax6.grid(True, linestyle="--", alpha=0.35)
+    ax6.set_title("F. Central Horizontal HU Profile (y = 0 mm)")
+    ax6.set_xlabel("x [mm]")
+    ax6.set_ylabel("Attenuation [HU]")
+    ax6.legend(loc="upper right", fontsize=8)
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(target, format="png")
+    return target
+
+
+def save_stage3_real_fbp_visual_qa(
+    out_path: str | Path,
+    *,
+    case_id: str,
+    z_slice_mm: float,
+    native_pitch: float,
+    ref_fbp_hu: np.ndarray,
+    fov_mask: np.ndarray,
+    fov_mm: float,
+    filter_name: str,
+    rdc_effective_pitch: float,
+    rdc_raw_fbp_hu: np.ndarray,
+    rdc_inpaint_fbp_hu: np.ndarray,
+    rdc_vs_ref_metrics: dict[str, float],
+    rdc_raw_vs_ref_metrics: dict[str, float],
+    vendor_slice_hu: np.ndarray | None = None,
+    vendor_fov_mm: float | None = None,
+    vendor_kernel: str | None = None,
+) -> Path:
+    """Save 6-panel (2x3) Stage 3 Real Patient `x_reference` vs Vendor CT & High-Pitch RDC FBP PNG."""
+    target = Path(out_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fmask = np.asarray(fov_mask, dtype=bool)
+    hp_residual = np.where(fmask, np.abs(rdc_inpaint_fbp_hu - ref_fbp_hu), 0.0)
+    p3_rgb = (
+        _panel_to_rgb(vendor_slice_hu, vmin=-1000.0, vmax=400.0)
+        if vendor_slice_hu is not None
+        else _panel_to_rgb(ref_fbp_hu, vmin=-400.0, vmax=1200.0)
+    )
+
+    if not _has_matplotlib():
+        return _compose_grid_png_stdlib(
+            target,
+            [
+                _panel_to_rgb(ref_fbp_hu, vmin=-1000.0, vmax=400.0),
+                _panel_to_rgb(ref_fbp_hu, vmin=-160.0, vmax=240.0),
+                p3_rgb,
+                _panel_to_rgb(rdc_raw_fbp_hu, vmin=-1000.0, vmax=400.0),
+                _panel_to_rgb(rdc_inpaint_fbp_hu, vmin=-1000.0, vmax=400.0),
+                _panel_to_rgb(hp_residual, vmin=0.0, vmax=180.0, heat=True),
+            ],
+            ncols=3,
+            tile_h=280,
+            tile_w=280,
+        )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    half_fov = 0.5 * float(fov_mm)
+    extent = [-half_fov, half_fov, -half_fov, half_fov]
+
+    fig = Figure(figsize=(17.5, 10.5), dpi=130)
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        f"Stage 3 Real-Data Visual QA ({case_id}) — Our Reference FBP (`x_reference`, {filter_name}) "
+        f"vs Vendor CT & High-Pitch RDC at z = {z_slice_mm:.1f} mm",
+        fontsize=12.5,
+        fontweight="bold",
+    )
+
+    ax1 = fig.add_subplot(2, 3, 1)
+    im1 = ax1.imshow(ref_fbp_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=extent, aspect="equal")
+    ax1.set_title(f"1. Our x_reference FBP (p={native_pitch:.2f}, Lung/Chest [-1000, 400] HU)")
+    ax1.set_xlabel("x [mm] (+x = Patient Left)")
+    ax1.set_ylabel("y [mm] (+y = Anterior)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    ax2 = fig.add_subplot(2, 3, 2)
+    im2 = ax2.imshow(ref_fbp_hu, cmap="gray", vmin=-160.0, vmax=240.0, extent=extent, aspect="equal")
+    ax2.set_title("2. Our x_reference FBP (Soft-Tissue Window [-160, 240] HU)")
+    ax2.set_xlabel("x [mm]")
+    ax2.set_ylabel("y [mm]")
+    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    ax3 = fig.add_subplot(2, 3, 3)
+    if vendor_slice_hu is not None:
+        vfov_half = 0.5 * float(vendor_fov_mm if vendor_fov_mm is not None else fov_mm)
+        v_ext = [-vfov_half, vfov_half, -vfov_half, vfov_half]
+        im3 = ax3.imshow(
+            vendor_slice_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=v_ext, aspect="equal"
+        )
+        k_txt = f"kernel={vendor_kernel}, " if vendor_kernel else ""
+        ax3.set_title(f"3. Published Vendor CT ({k_txt}Visual Sanity Only)")
+        ax3.set_xlabel("x [mm] (Vendor FOV)")
+        ax3.set_ylabel("y [mm]")
+        fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+    else:
+        im3 = ax3.imshow(
+            ref_fbp_hu, cmap="gray", vmin=-300.0, vmax=1200.0, extent=extent, aspect="equal"
+        )
+        ax3.set_title("3. Our x_reference FBP (Bone Window [-300, 1200] HU)")
+        ax3.set_xlabel("x [mm]")
+        ax3.set_ylabel("y [mm]")
+        fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+    ax4 = fig.add_subplot(2, 3, 4)
+    im4 = ax4.imshow(
+        rdc_raw_fbp_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=extent, aspect="equal"
+    )
+    ax4.set_title(
+        f"4. High-Pitch RDC (p={rdc_effective_pitch:.2f}) WITHOUT Fill (RMSE={rdc_raw_vs_ref_metrics['rmse_hu']:.1f} HU)"
+    )
+    ax4.set_xlabel("x [mm] (Raw Wedge Discontinuity Streaks)")
+    ax4.set_ylabel("y [mm]")
+    fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+
+    ax5 = fig.add_subplot(2, 3, 5)
+    im5 = ax5.imshow(
+        rdc_inpaint_fbp_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=extent, aspect="equal"
+    )
+    ax5.set_title(
+        f"5. High-Pitch RDC (p={rdc_effective_pitch:.2f}) + Conjugate Fill (RMSE={rdc_vs_ref_metrics['rmse_hu']:.1f} HU)"
+    )
+    ax5.set_xlabel(f"x [mm] (SSIM vs x_ref = {rdc_vs_ref_metrics['ssim']:.3f})")
+    ax5.set_ylabel("y [mm]")
+    fig.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
+
+    ax6 = fig.add_subplot(2, 3, 6)
+    im6 = ax6.imshow(hp_residual, cmap="magma", vmin=0.0, vmax=180.0, extent=extent, aspect="equal")
+    ax6.set_title(
+        f"6. Pure High-Pitch Artifact |x_RDC - x_ref| (MAE={rdc_vs_ref_metrics['mae_hu']:.1f} HU)"
+    )
+    ax6.set_xlabel("x [mm] (Target Signal for Stage 7 Dual-Domain DL)")
+    ax6.set_ylabel("y [mm]")
+    fig.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(target, format="png")
+    return target
+

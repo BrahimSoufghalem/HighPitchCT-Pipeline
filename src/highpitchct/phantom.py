@@ -208,6 +208,67 @@ def voxelize_phantom(
     }
 
 
+def voxelize_phantom_slices_radiological(
+    ellipsoids: list[Ellipsoid3D],
+    *,
+    z_slices_mm: np.ndarray | list[float],
+    image_size: int = 256,
+    fov_mm: float = 360.0,
+    center_xy_mm: tuple[float, float] = (0.0, 0.0),
+    water_mu_mm_inv: float = 0.0192,
+) -> dict[str, np.ndarray]:
+    """Evaluate exact 3D phantom slices on radiological (Row 0 = +y Anterior, Col 0 = -x Right) grid."""
+    n_xy = int(image_size)
+    if n_xy < 2:
+        raise ValueError(f"image_size must be >= 2, got {image_size}")
+    if float(fov_mm) <= 0.0:
+        raise ValueError(f"fov_mm must be positive, got {fov_mm}")
+
+    z_arr = np.asarray(z_slices_mm, dtype=np.float64).reshape(-1)
+    d_xy = float(fov_mm) / float(n_xy)
+    half_idx = 0.5 * (n_xy - 1.0)
+    x_mm = float(center_xy_mm[0]) + (np.arange(n_xy, dtype=np.float64) - half_idx) * d_xy
+    y_mm = float(center_xy_mm[1]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
+
+    mu_slices = np.zeros((z_arr.size, n_xy, n_xy), dtype=np.float32)
+    yy_2d, xx_2d = np.meshgrid(y_mm, x_mm, indexing="ij")
+
+    for ell in ellipsoids:
+        cx, cy, cz = ell.center_xyz_mm
+        ax, ay, az = ell.semi_axes_xyz_mm
+        dmu = np.float32(ell.delta_mu_mm_inv(water_mu_mm_inv))
+        z_norm_sq = ((z_arr - cz) / az) ** 2
+        active_z = np.where(z_norm_sq <= 1.0)[0]
+        if active_z.size == 0:
+            continue
+
+        px = xx_2d - cx
+        py = yy_2d - cy
+        if ell.yaw_rad != 0.0:
+            c_yaw = math.cos(ell.yaw_rad)
+            s_yaw = math.sin(ell.yaw_rad)
+            rx = px * c_yaw + py * s_yaw
+            ry = -px * s_yaw + py * c_yaw
+        else:
+            rx, ry = px, py
+
+        xy_norm_sq = (rx / ax) ** 2 + (ry / ay) ** 2
+        for kz in active_z:
+            mask_2d = (xy_norm_sq + z_norm_sq[kz]) <= 1.0
+            mu_slices[kz, mask_2d] += dmu
+
+    mu_slices = np.maximum(mu_slices, np.float32(0.0))
+    hu_slices = mu_to_hu(mu_slices, water_mu_mm_inv=water_mu_mm_inv)
+    return {
+        "mu_slices": mu_slices,
+        "hu_slices": hu_slices,
+        "z_mm": z_arr,
+        "y_mm": y_mm,
+        "x_mm": x_mm,
+        "pixel_spacing_mm": np.array(d_xy, dtype=np.float64),
+    }
+
+
 def _ray_ellipsoid_chord_lengths(
     origins_xyz: np.ndarray,
     unit_dirs_xyz: np.ndarray,

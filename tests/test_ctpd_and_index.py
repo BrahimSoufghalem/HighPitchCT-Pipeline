@@ -24,6 +24,13 @@ from highpitchct.ctpd_tags import (
 from highpitchct.index_dicom import index_dicom_tree
 
 
+def _save_dicom_clean(path: Path, ds: "FileDataset") -> None:
+    try:
+        pydicom.dcmwrite(str(path), ds, enforce_file_format=True)
+    except TypeError:
+        ds.save_as(str(path), write_like_original=False)
+
+
 def _write_synthetic_ctpd_projection(
     path: Path,
     *,
@@ -35,13 +42,13 @@ def _write_synthetic_ctpd_projection(
     patient_id: str = "SYNTH_01",
 ) -> None:
     meta = FileMetaDataset()
+    meta.FileMetaInformationVersion = b"\x00\x01"
     meta.MediaStorageSOPClassUID = RAW_DATA_SOP_CLASS_UID
     meta.MediaStorageSOPInstanceUID = f"{series_uid}.{instance_number}"
     meta.TransferSyntaxUID = ImplicitVRLittleEndian
+    meta.ImplementationClassUID = "1.2.826.0.1.3680043.10.999"
 
     ds = FileDataset(str(path), {}, file_meta=meta, preamble=b"\x00" * 128)
-    ds.is_little_endian = True
-    ds.is_implicit_VR = True
     ds.SOPClassUID = RAW_DATA_SOP_CLASS_UID
     ds.SOPInstanceUID = f"{series_uid}.{instance_number}"
     ds.StudyInstanceUID = study_uid
@@ -69,7 +76,7 @@ def _write_synthetic_ctpd_projection(
     ds.add_new((0x7033, 0x100E), "UN", b"FFSZ")
     ds.add_new((0x7033, 0x1013), "UN", struct.pack("<H", 1152))
     ds.add_new((0x7041, 0x1001), "UN", b"0.0192")
-    ds.save_as(str(path), write_like_original=False)
+    _save_dicom_clean(path, ds)
 
 
 def _write_synthetic_ct_image(
@@ -83,13 +90,13 @@ def _write_synthetic_ct_image(
     patient_id: str = "SYNTH_01",
 ) -> None:
     meta = FileMetaDataset()
+    meta.FileMetaInformationVersion = b"\x00\x01"
     meta.MediaStorageSOPClassUID = CT_IMAGE_SOP_CLASS_UID
     meta.MediaStorageSOPInstanceUID = f"{series_uid}.{instance_number}"
     meta.TransferSyntaxUID = ImplicitVRLittleEndian
+    meta.ImplementationClassUID = "1.2.826.0.1.3680043.10.999"
 
     ds = FileDataset(str(path), {}, file_meta=meta, preamble=b"\x00" * 128)
-    ds.is_little_endian = True
-    ds.is_implicit_VR = True
     ds.SOPClassUID = CT_IMAGE_SOP_CLASS_UID
     ds.SOPInstanceUID = f"{series_uid}.{instance_number}"
     ds.StudyInstanceUID = study_uid
@@ -109,7 +116,7 @@ def _write_synthetic_ct_image(
     ref_raw_item = Dataset()
     ref_raw_item.add_new((0x0008, 0x1115), "SQ", Sequence([ref_series_item]))
     ds.add_new((0x0008, 0x9121), "SQ", Sequence([ref_raw_item]))
-    ds.save_as(str(path), write_like_original=False)
+    _save_dicom_clean(path, ds)
 
 
 @unittest.skipUnless(HAS_PYDICOM, "pydicom is required for DICOM-CT-PD indexing tests")

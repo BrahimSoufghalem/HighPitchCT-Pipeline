@@ -228,10 +228,10 @@ def build_curved_to_flat_plan(
             v_flat_mm=v_grid,
         )
         valid = (
-            (r_hit >= 0.0)
-            & (r_hit <= float(geometry.n_rows - 1))
-            & (c_hit >= 0.0)
-            & (c_hit <= float(geometry.n_cols - 1))
+            (r_hit >= -1e-11)
+            & (r_hit <= float(geometry.n_rows - 1) + 1e-11)
+            & (c_hit >= -1e-11)
+            & (c_hit <= float(geometry.n_cols - 1) + 1e-11)
         )
 
         r_clamped = np.clip(r_hit, 0.0, float(geometry.n_rows - 1))
@@ -388,16 +388,18 @@ def rebin_curved_to_flat_scalar_ref(
                 )
                 rf = float(r_hit_arr)
                 cf = float(c_hit_arr)
-                if 0.0 <= rf <= float(geometry.n_rows - 1) and 0.0 <= cf <= float(
+                if -1e-11 <= rf <= float(geometry.n_rows - 1) + 1e-11 and -1e-11 <= cf <= float(
                     geometry.n_cols - 1
-                ):
+                ) + 1e-11:
                     valid_out[i, n, m] = True
-                    r0 = int(math.floor(rf))
-                    c0 = int(math.floor(cf))
+                    rf_c = min(max(rf, 0.0), float(geometry.n_rows - 1))
+                    cf_c = min(max(cf, 0.0), float(geometry.n_cols - 1))
+                    r0 = int(math.floor(rf_c))
+                    c0 = int(math.floor(cf_c))
                     r1 = min(r0 + 1, geometry.n_rows - 1)
                     c1 = min(c0 + 1, geometry.n_cols - 1)
-                    wr = rf - r0
-                    wc = cf - c0
+                    wr = rf_c - r0
+                    wc = cf_c - c0
                     val = (
                         (1.0 - wr) * (1.0 - wc) * proj_arr[i, r0, c0]
                         + (1.0 - wr) * wc * proj_arr[i, r0, c1]
@@ -664,12 +666,19 @@ def rebin_helical_ssrb(
     group_cache: list[dict[str, Any]] = []
     for idx_g in groups:
         rho_g = float(np.mean(rho_s_all[idx_g]))
-        ratio_sin = (float(geometry.rho0_mm) / rho_g) * sin_alpha_virt
-        valid_sin = np.abs(ratio_sin) <= 1.0
-        alpha_g = np.arcsin(np.clip(ratio_sin, -1.0, 1.0))
-        u_g = float(geometry.d0_mm) * np.tan(alpha_g)
-        c_g = (u_g / du_eff) + c_flat_0
-        valid_col = valid_sin & (c_g >= 0.0) & (c_g <= float(n_u - 1))
+        if abs(rho_g - float(geometry.rho0_mm)) <= 1e-12:
+            d_alpha_g = np.zeros(n_u, dtype=np.float64)
+            u_g = u_coords.copy()
+            c_g = np.arange(n_u, dtype=np.float64)
+            valid_col = np.ones(n_u, dtype=bool)
+        else:
+            ratio_sin = (float(geometry.rho0_mm) / rho_g) * sin_alpha_virt
+            valid_sin = np.abs(ratio_sin) <= (1.0 + 1e-12)
+            alpha_g = np.arcsin(np.clip(ratio_sin, -1.0, 1.0))
+            d_alpha_g = alpha_virt - alpha_g
+            u_g = float(geometry.d0_mm) * np.tan(alpha_g)
+            c_g = (u_g / du_eff) + c_flat_0
+            valid_col = valid_sin & (c_g >= -1e-11) & (c_g <= float(n_u - 1) + 1e-11)
 
         c_clamped = np.clip(c_g, 0.0, float(n_u - 1))
         c0_g = np.floor(c_clamped).astype(np.intp)
@@ -693,7 +702,7 @@ def rebin_helical_ssrb(
         group_cache.append(
             {
                 "idx_g": idx_g,
-                "d_alpha": alpha_virt - alpha_g,  # (n_u,)
+                "d_alpha": d_alpha_g,  # (n_u,)
                 "valid_col": valid_col,  # (n_u,)
                 "c0": c0_g,
                 "c1": c1_g,
@@ -731,8 +740,8 @@ def rebin_helical_ssrb(
             for ell in range(ell_min, ell_max + 1):
                 phi_star = base_phi + (2.0 * math.pi * float(ell))
                 cand_ok = (
-                    (phi_star >= phi_min)
-                    & (phi_star <= phi_max)
+                    (phi_star >= phi_min - 1e-11)
+                    & (phi_star <= phi_max + 1e-11)
                     & gc["valid_col"][None, :]
                 )
                 if not np.any(cand_ok):
@@ -754,7 +763,8 @@ def rebin_helical_ssrb(
                         continue
 
                 k_sub, m_sub = np.where(cand_ok)
-                pos_f = np.interp(phi_star[k_sub, m_sub], phi_sorted, gc["pos_sorted"])
+                phi_clamped = np.clip(phi_star[k_sub, m_sub], phi_min, phi_max)
+                pos_f = np.interp(phi_clamped, phi_sorted, gc["pos_sorted"])
                 j0 = np.floor(pos_f).astype(np.intp)
                 j1 = np.minimum(j0 + 1, idx_g.size - 1)
                 wj = pos_f - j0
@@ -763,14 +773,14 @@ def rebin_helical_ssrb(
                 v_cand = (z_sl - z_star) * gc["noo_u_factor"][m_sub]
                 r_cand = r_flat_0 - (v_cand / dv_eff)
 
-                in_row = (r_cand >= r_min_act) & (r_cand <= r_max_act)
+                in_row = (r_cand >= r_min_act - 1e-11) & (r_cand <= r_max_act + 1e-11)
                 if not np.any(in_row):
                     continue
 
                 k_ok = k_sub[in_row]
                 m_ok = m_sub[in_row]
                 v_ok = v_cand[in_row]
-                r_ok = r_cand[in_row]
+                r_ok = np.clip(r_cand[in_row], r_min_act, r_max_act)
                 j0_ok = j0[in_row]
                 j1_ok = j1[in_row]
                 wj_ok = wj[in_row]
@@ -803,7 +813,7 @@ def rebin_helical_ssrb(
                 m_fin = m_ok[corners_valid]
                 abs_v_fin = np.abs(v_ok[corners_valid])
 
-                better = abs_v_fin < best_abs_v[k_fin, m_fin]
+                better = abs_v_fin < (best_abs_v[k_fin, m_fin] - 1e-11)
                 if not np.any(better):
                     continue
 
@@ -933,18 +943,26 @@ def rebin_helical_ssrb_scalar_ref(
 
                 for idx_g in groups:
                     rho_g = float(np.mean(rho_s_all[idx_g]))
-                    ratio_s = (float(geometry.rho0_mm) / rho_g) * math.sin(alpha_m)
-                    if abs(ratio_s) > 1.0:
-                        continue
-                    alpha_g = math.asin(ratio_s)
-                    u_g = float(geometry.d0_mm) * math.tan(alpha_g)
-                    c_g = (u_g / du_eff) + c_flat_0
-                    if c_g < 0.0 or c_g > float(n_u - 1):
-                        continue
+                    if abs(rho_g - float(geometry.rho0_mm)) <= 1e-12:
+                        d_alpha_m = 0.0
+                        u_g = u_m
+                        c_g = float(m)
+                    else:
+                        ratio_s = (float(geometry.rho0_mm) / rho_g) * math.sin(alpha_m)
+                        if abs(ratio_s) > (1.0 + 1e-12):
+                            continue
+                        ratio_clamped = min(max(ratio_s, -1.0), 1.0)
+                        alpha_g = math.asin(ratio_clamped)
+                        d_alpha_m = alpha_m - alpha_g
+                        u_g = float(geometry.d0_mm) * math.tan(alpha_g)
+                        c_g = (u_g / du_eff) + c_flat_0
+                        if c_g < -1e-11 or c_g > float(n_u - 1) + 1e-11:
+                            continue
 
-                    c0 = int(math.floor(c_g))
+                    c_cl = min(max(c_g, 0.0), float(n_u - 1))
+                    c0 = int(math.floor(c_cl))
                     c1 = min(c0 + 1, n_u - 1)
-                    wc = c_g - c0
+                    wc = c_cl - c0
 
                     phi_g = phi_s_all[idx_g]
                     z_g = z_s_all[idx_g]
@@ -953,20 +971,21 @@ def rebin_helical_ssrb_scalar_ref(
                     else:
                         phi_min, phi_max = float(phi_g[-1]), float(phi_g[0])
 
-                    base_phi = beta_k + (alpha_m - alpha_g)
+                    base_phi = beta_k + d_alpha_m
                     ell_min = int(math.floor((phi_min - base_phi) / (2.0 * math.pi)))
                     ell_max = int(math.ceil((phi_max - base_phi) / (2.0 * math.pi)))
 
                     for ell in range(ell_min, ell_max + 1):
                         phi_star = base_phi + 2.0 * math.pi * float(ell)
-                        if phi_star < phi_min or phi_star > phi_max:
+                        if phi_star < phi_min - 1e-11 or phi_star > phi_max + 1e-11:
                             continue
+                        phi_cl = min(max(phi_star, phi_min), phi_max)
 
                         # Find bracketing pair (j0, j1) in idx_g
                         if phi_g[-1] >= phi_g[0]:
                             pos_f = float(
                                 np.interp(
-                                    phi_star,
+                                    phi_cl,
                                     phi_g,
                                     np.arange(idx_g.size, dtype=np.float64),
                                 )
@@ -974,7 +993,7 @@ def rebin_helical_ssrb_scalar_ref(
                         else:
                             pos_f = float(
                                 np.interp(
-                                    phi_star,
+                                    phi_cl,
                                     phi_g[::-1],
                                     np.arange(idx_g.size, dtype=np.float64)[::-1],
                                 )
@@ -989,12 +1008,13 @@ def rebin_helical_ssrb_scalar_ref(
                             d0_sq_u_sq / (rho_g * float(geometry.d0_mm))
                         )
                         r_cand = r_flat_0 - (v_cand / dv_eff)
-                        if r_cand < r_min_act or r_cand > r_max_act:
+                        if r_cand < r_min_act - 1e-11 or r_cand > r_max_act + 1e-11:
                             continue
+                        r_cl = min(max(r_cand, r_min_act), r_max_act)
 
-                        r0 = int(math.floor(r_cand))
+                        r0 = int(math.floor(r_cl))
                         r1 = min(r0 + 1, r_upper_int)
-                        wr = r_cand - r0
+                        wr = r_cl - r0
 
                         v0_gl = int(idx_g[j0])
                         v1_gl = int(idx_g[j1])
@@ -1010,7 +1030,7 @@ def rebin_helical_ssrb_scalar_ref(
                         ):
                             continue
 
-                        if abs(v_cand) >= best_abs_v:
+                        if abs(v_cand) >= best_abs_v - 1e-11:
                             continue
 
                         val0 = (

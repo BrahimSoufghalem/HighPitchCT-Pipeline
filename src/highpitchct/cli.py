@@ -1,4 +1,4 @@
-"""Command-line interface for Stage 0, Stage 1, and Stage 2 of HighPitchCT-Pipeline."""
+"""Command-line interface for Stage 0, Stage 1, Stage 2, and Stage 3 of HighPitchCT-Pipeline."""
 
 from __future__ import annotations
 
@@ -22,10 +22,12 @@ from .ctpd_reader import (
 from .index_dicom import index_dicom_tree
 from .manifest import read_series_manifest, write_series_manifest
 from .phantom import (
+    Ellipsoid3D,
     build_thorax_phantom,
     make_synthetic_helical_geometry,
     project_phantom_helical,
     voxelize_phantom,
+    voxelize_phantom_slices_radiological,
     write_synthetic_ctpd_series,
 )
 from .rebinning import (
@@ -36,6 +38,12 @@ from .rebinning import (
     rebin_helical_ssrb_scalar_ref,
     rebin_series_ssrb_streaming,
 )
+from .recon_fbp import (
+    compute_reconstruction_metrics,
+    reconstruct_fanbeam_fbp,
+    reconstruct_fanbeam_fbp_scalar_ref,
+    reconstruct_series_reference_streaming,
+)
 from .runtime import print_runtime_report, resolve_environment_profile
 from .tcia_client import DEFAULT_COLLECTION, discover_tcia_series, download_manifest_with_profile
 from .visual_qa import (
@@ -43,6 +51,8 @@ from .visual_qa import (
     save_stage1_real_visual_qa,
     save_stage2_phantom_ssrb_visual_qa,
     save_stage2_real_ssrb_visual_qa,
+    save_stage3_phantom_fbp_visual_qa,
+    save_stage3_real_fbp_visual_qa,
 )
 
 
@@ -348,10 +358,222 @@ def _run_stage2_synthetic_phantom_check(
     }
 
 
+def _run_stage3_synthetic_phantom_check(
+    *,
+    figures_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Run Stage 3 synthetic verification: 0-HU water calibration, scalar parity, and Thorax FBP QA."""
+    t0 = time.monotonic()
+
+    # 1. Exact uniform 0 HU water cylinder calibration (zero-bias spatial Ram-Lak proof)
+    water_cyl = [Ellipsoid3D("water_cylinder", (0.0, 0.0, 0.0), (110.0, 110.0, 220.0), 1000.0, 0.0)]
+    geom_w = make_synthetic_helical_geometry(
+        n_views=576,
+        n_rows=24,
+        n_cols=256,
+        angular_steps_per_rotation=384,
+        normalized_pitch=0.85,
+        detector_shape="CYLINDRICAL",
+        ffs_mode="FFSZ",
+        rotation_direction=-1,
+        quarter_detector_offset_cols=1.125,
+        du_mm=2.0,
+        dv_mm=2.0,
+    )
+    proj_w = project_phantom_helical(water_cyl, geom_w, batch_views=128, show_progress=False)
+    flat_w, valid_w = rebin_curved_to_flat(proj_w, geom_w)
+    ssrb_w = rebin_helical_ssrb(flat_w, valid_w, geom_w, [0.0], angular_mode="short_scan")
+    fbp_w = reconstruct_fanbeam_fbp(
+        ssrb_w,
+        image_size=192,
+        fov_mm=340.0,
+        water_mu_mm_inv=geom_w.water_mu_mm_inv,
+        filter_name="hann",
+    )
+    yy_w, xx_w = np.meshgrid(fbp_w.y_mm, fbp_w.x_mm, indexing="ij")
+    roi_water = (xx_w * xx_w + yy_w * yy_w) <= (85.0 ** 2)
+    water_mean_hu = float(np.mean(fbp_w.hu_slices[0][roi_water]))
+    water_std_hu = float(np.std(fbp_w.hu_slices[0][roi_water]))
+
+    # 2. Vectorized vs Scalar FBP parity on 32 x 32 grid
+    fbp_vec_small = reconstruct_fanbeam_fbp(
+        ssrb_w,
+        image_size=32,
+        fov_mm=340.0,
+        water_mu_mm_inv=geom_w.water_mu_mm_inv,
+        filter_name="hann",
+        lateral_pad_cols=32,
+    )
+    fbp_ref_small = reconstruct_fanbeam_fbp_scalar_ref(
+        ssrb_w,
+        image_size=32,
+        fov_mm=340.0,
+        water_mu_mm_inv=geom_w.water_mu_mm_inv,
+        filter_name="hann",
+        lateral_pad_cols=32,
+    )
+    scalar_max_hu_diff = float(np.max(np.abs(fbp_vec_small.hu_slices - fbp_ref_small.hu_slices)))
+    scalar_max_mu_diff = float(np.max(np.abs(fbp_vec_small.mu_slices - fbp_ref_small.mu_slices)))
+
+    # 3. 3D Asymmetric Thorax Phantom: Reference (pitch=0.85) vs High-Pitch (pitch=1.85) FBP
+    phantom = build_thorax_phantom(axial_scale=0.8)
+    z_test = -12.0  # Intersects heart (+16, +32, -14.4), lungs, aorta, and posterior spine!
+    geom_low = make_synthetic_helical_geometry(
+        n_views=768,
+        n_rows=32,
+        n_cols=320,  # R_FOV=189.6 mm > thorax trunk 155 mm (no truncation)
+        angular_steps_per_rotation=384,
+        normalized_pitch=0.85,
+        detector_shape="CYLINDRICAL",
+        ffs_mode="FFSZ",
+        rotation_direction=-1,
+        quarter_detector_offset_cols=1.125,
+        du_mm=2.2,
+        dv_mm=1.8,
+        z_center_mm=z_test,
+    )
+    proj_low = project_phantom_helical(phantom, geom_low, batch_views=128, show_progress=False)
+    flat_low, valid_low = rebin_curved_to_flat(proj_low, geom_low)
+    ssrb_low = rebin_helical_ssrb(flat_low, valid_low, geom_low, [z_test], angular_mode="short_scan")
+    fbp_ref = reconstruct_fanbeam_fbp(
+        ssrb_low,
+        image_size=256,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+        filter_name="hann",
+    )
+
+    geom_high = make_synthetic_helical_geometry(
+        n_views=768,
+        n_rows=32,
+        n_cols=320,  # R_FOV=189.6 mm > thorax trunk 155 mm (no truncation)
+        angular_steps_per_rotation=384,
+        normalized_pitch=1.85,
+        detector_shape="CYLINDRICAL",
+        ffs_mode="FFSZ",
+        rotation_direction=-1,
+        quarter_detector_offset_cols=1.125,
+        du_mm=2.2,
+        dv_mm=1.8,
+        z_center_mm=z_test,
+    )
+    proj_high = project_phantom_helical(phantom, geom_high, batch_views=128, show_progress=False)
+    flat_high, valid_high = rebin_curved_to_flat(proj_high, geom_high)
+    ssrb_high = rebin_helical_ssrb(
+        flat_high,
+        valid_high,
+        geom_high,
+        [z_test],
+        angular_mode="short_scan",
+        active_row_range=(4.0, 27.0),
+    )
+    fbp_hp_raw = reconstruct_fanbeam_fbp(
+        ssrb_high,
+        image_size=256,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_high.water_mu_mm_inv,
+        filter_name="hann",
+        inpaint_mode="none",
+    )
+    fbp_hp_inpaint = reconstruct_fanbeam_fbp(
+        ssrb_high,
+        image_size=256,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_high.water_mu_mm_inv,
+        filter_name="hann",
+        inpaint_mode="conjugate_feather",
+    )
+
+    gt_vox = voxelize_phantom_slices_radiological(
+        phantom,
+        z_slices_mm=[z_test],
+        image_size=256,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+    )
+    gt_hu = gt_vox["hu_slices"][0]
+    ref_metrics = compute_reconstruction_metrics(
+        fbp_ref.hu_slices[0], gt_hu, fov_mask=fbp_ref.fov_mask
+    )
+    hp_raw_metrics = compute_reconstruction_metrics(
+        fbp_hp_raw.hu_slices[0], gt_hu, fov_mask=fbp_ref.fov_mask
+    )
+    hp_inpaint_metrics = compute_reconstruction_metrics(
+        fbp_hp_inpaint.hu_slices[0], gt_hu, fov_mask=fbp_ref.fov_mask
+    )
+
+    # Radiological orientation ROI sanity checks (+x Left, +y Anterior, -y Posterior)
+    yy_p, xx_p = np.meshgrid(fbp_ref.y_mm, fbp_ref.x_mm, indexing="ij")
+    roi_heart = ((xx_p - 8.0) ** 2 + (yy_p - 36.0) ** 2) <= (10.0 ** 2)
+    roi_right_lung = ((xx_p + 64.0) ** 2 + (yy_p - 8.0) ** 2) <= (22.0 ** 2)
+    roi_spine = ((xx_p - 0.0) ** 2 + (yy_p + 68.0) ** 2) <= (8.0 ** 2)
+
+    heart_hu = float(np.mean(fbp_ref.hu_slices[0][roi_heart]))
+    right_lung_hu = float(np.mean(fbp_ref.hu_slices[0][roi_right_lung]))
+    spine_hu = float(np.mean(fbp_ref.hu_slices[0][roi_spine]))
+    orientation_rois_pass = bool(
+        (25.0 <= heart_hu <= 85.0)
+        and (-800.0 <= right_lung_hu <= -700.0)
+        and (spine_hu >= 120.0)
+    )
+
+    qa_png_str: str | None = None
+    if figures_dir is not None:
+        qa_png = save_stage3_phantom_fbp_visual_qa(
+            figures_dir / "stage3_phantom_fbp_visual_qa.png",
+            gt_hu=gt_hu,
+            ref_fbp_hu=fbp_ref.hu_slices[0],
+            high_pitch_raw_fbp_hu=fbp_hp_raw.hu_slices[0],
+            high_pitch_inpaint_fbp_hu=fbp_hp_inpaint.hu_slices[0],
+            fov_mask=fbp_ref.fov_mask,
+            fov_mm=fbp_ref.fov_mm,
+            z_slice_mm=z_test,
+            low_pitch=0.85,
+            high_pitch=1.85,
+            ref_metrics=ref_metrics,
+            hp_raw_metrics=hp_raw_metrics,
+            hp_inpaint_metrics=hp_inpaint_metrics,
+        )
+        qa_png_str = str(qa_png)
+
+    overall_pass = bool(
+        abs(water_mean_hu) < 2.0
+        and water_std_hu < 4.0
+        and scalar_max_hu_diff < 0.05
+        and orientation_rois_pass
+        and ref_metrics["ssim"] >= 0.88
+        and hp_inpaint_metrics["rmse_hu"] < hp_raw_metrics["rmse_hu"]
+    )
+    return {
+        "pass": overall_pass,
+        "elapsed_seconds": round(time.monotonic() - t0, 3),
+        "water_cylinder_calibration": {
+            "mean_hu": round(water_mean_hu, 4),
+            "std_hu": round(water_std_hu, 4),
+            "pass": bool(abs(water_mean_hu) < 2.0 and water_std_hu < 4.0),
+        },
+        "scalar_parity": {
+            "max_abs_hu_diff": round(scalar_max_hu_diff, 6),
+            "max_abs_mu_diff_mm_inv": round(scalar_max_mu_diff, 9),
+            "pass": bool(scalar_max_hu_diff < 0.05),
+        },
+        "radiological_orientation_rois_hu": {
+            "heart_anterior_left_hu": round(heart_hu, 2),
+            "right_lung_minus_x_hu": round(right_lung_hu, 2),
+            "spine_posterior_minus_y_hu": round(spine_hu, 2),
+            "pass": orientation_rois_pass,
+        },
+        "thorax_phantom_pitch_0p85_vs_gt": ref_metrics,
+        "thorax_phantom_pitch_1p85_raw_no_fill_vs_gt": hp_raw_metrics,
+        "thorax_phantom_pitch_1p85_conjugate_fill_vs_gt": hp_inpaint_metrics,
+        "visual_qa_png": qa_png_str,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hpct",
-        description="HighPitchCT CLI (Stage 0 download/index, Stage 1 geometry/reader audit, Stage 2 SSRB)",
+        description="HighPitchCT CLI (Stage 0 download/index, Stage 1 audit, Stage 2 SSRB, Stage 3 FBP)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -509,6 +731,78 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage2.add_argument("--workers", type=int, default=8)
     stage2.add_argument("--no-progress", action="store_true")
+
+    stage3 = sub.add_parser(
+        "stage3-recon",
+        help="Stage 3 Sinogram Completion + Exact Parker Weighting + Fan-Beam FBP (`x_reference`) & Visual QA",
+    )
+    stage3.add_argument("--data-root", help="Writable root containing raw/tcia and manifests/")
+    stage3.add_argument(
+        "--case-id",
+        help="Optional patient case filter under raw/tcia (matches C012 or case_C012)",
+    )
+    stage3.add_argument("--series-dir", help="Explicit DICOM-CT-PD projection directory to reconstruct")
+    stage3.add_argument("--image-dir", help="Optional published CT image directory for side-by-side Visual QA")
+    stage3.add_argument(
+        "--num-slices",
+        type=int,
+        default=5,
+        help="Number of interior axial z slices to reconstruct (default: 5)",
+    )
+    stage3.add_argument(
+        "--image-size",
+        type=int,
+        default=512,
+        help="Reconstructed axial matrix size H = W (default: 512)",
+    )
+    stage3.add_argument(
+        "--fov-mm",
+        type=float,
+        default=None,
+        help="Reconstruction FOV diameter [mm] (default: scanner non-truncated FOV 2*rho0*sin(gamma_max))",
+    )
+    stage3.add_argument(
+        "--filter",
+        dest="filter_name",
+        choices=["ramp", "shepp_logan", "cosine", "hamming", "hann"],
+        default="hann",
+        help="Ramp apodization filter (default: hann)",
+    )
+    stage3.add_argument(
+        "--cutoff-ratio",
+        type=float,
+        default=1.0,
+        help="Normalized Nyquist frequency cutoff in (0, 1] (default: 1.0)",
+    )
+    stage3.add_argument(
+        "--angular-mode",
+        choices=["short_scan", "full_scan"],
+        default="short_scan",
+        help="Target planar sinogram angular span: short_scan (Parker) or full_scan (0.5 weight)",
+    )
+    stage3.add_argument(
+        "--inpaint-mode",
+        choices=["conjugate_feather", "angular_feather", "none"],
+        default="conjugate_feather",
+        help="High-pitch missing-wedge completion strategy (default: conjugate_feather)",
+    )
+    stage3.add_argument(
+        "--backend",
+        choices=["numpy", "torch", "torch_cuda"],
+        default="numpy",
+        help="Backprojection execution backend (default: numpy; torch_cuda requires GPU without fallback)",
+    )
+    stage3.add_argument(
+        "--recon-out",
+        help="Optional compressed .npz path to save reconstructed mu_slices, hu_slices, and coordinate grids",
+    )
+    stage3.add_argument(
+        "--run-phantom-check",
+        action="store_true",
+        help="Run Stage 3 synthetic verification (0-HU water calibration + scalar parity + Thorax FBP QA)",
+    )
+    stage3.add_argument("--workers", type=int, default=8)
+    stage3.add_argument("--no-progress", action="store_true")
 
     environment = sub.add_parser(
         "env", help="Report Kaggle/Full profile, disk quota, RAM, disk space, and GPUs"
@@ -961,7 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 2 (v0.5.0)",
+            "stage": "Stage 2 (v0.6.0)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "rebinned_series_count": len(rebinned_series),
@@ -969,6 +1263,233 @@ def main(argv: list[str] | None = None) -> int:
             "synthetic_phantom_ssrb_check": phantom_stage2,
         }
         out_json = env_prof.data_root / "manifests" / "stage2_rebin_report.json"
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report["report_json"] = str(out_json)
+        print(json.dumps(report, indent=2))
+        return 0 if all_pass else 1
+
+    if args.command == "stage3-recon":
+        if args.workers < 1:
+            raise SystemExit("--workers must be at least 1")
+        if args.num_slices < 1:
+            raise SystemExit("--num-slices must be at least 1")
+        if args.image_size < 16:
+            raise SystemExit("--image-size must be at least 16")
+
+        t_start = time.monotonic()
+        env_prof = resolve_environment_profile(data_root=args.data_root)
+        show_prog = not args.no_progress
+        figures_dir = env_prof.data_root / "manifests" / "figures"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+
+        targets = _resolve_cli_series_targets(
+            env_prof.data_root / "raw" / "tcia",
+            case_id=args.case_id,
+            series_dir=args.series_dir,
+            image_dir=args.image_dir,
+            allow_empty_for_phantom=bool(args.run_phantom_check),
+        )
+
+        reconstructed_series: list[dict[str, Any]] = []
+        all_pass = True
+
+        for idx_t, (cid, pdir, idir) in enumerate(targets):
+            geom, files = scan_projection_series(
+                pdir, workers=args.workers, show_progress=show_prog
+            )
+            traj = geom.trajectory_metrics()
+            native_pitch = float(traj["normalized_pitch"])
+            z_min_raw = float(np.min(geom.z0_mm))
+            z_max_raw = float(np.max(geom.z0_mm))
+            margin_mm = min(
+                1.5 * geom.coverage_isocenter_mm,
+                0.25 * max(0.0, z_max_raw - z_min_raw),
+            )
+            if args.num_slices == 1:
+                z_slices = np.array([0.5 * (z_min_raw + z_max_raw)], dtype=np.float64)
+            else:
+                z_slices = np.linspace(
+                    z_min_raw + margin_mm,
+                    z_max_raw - margin_mm,
+                    args.num_slices,
+                    dtype=np.float64,
+                )
+
+            ssrb_ref, fbp_ref = reconstruct_series_reference_streaming(
+                files,
+                z_slices,
+                geometry=geom,
+                angular_mode=args.angular_mode,
+                image_size=args.image_size,
+                fov_mm=args.fov_mm,
+                filter_name=args.filter_name,
+                cutoff_ratio=args.cutoff_ratio,
+                inpaint_mode=args.inpaint_mode,
+                backend=args.backend,
+                workers=min(args.workers, 6),
+                show_progress=show_prog,
+            )
+
+            mid_slice_idx = len(z_slices) // 2
+            z_mid = float(z_slices[mid_slice_idx])
+            ref_mid_hu = fbp_ref.hu_slices[mid_slice_idx]
+
+            # Mid-slice High-Pitch RDC (50% central rows) FBP ablation: No-Fill vs Conjugate-Feather Fill
+            r_lo_rdc = float(geom.n_rows // 4)
+            r_hi_rdc = float(geom.n_rows - (geom.n_rows // 4) - 1)
+            active_rows_rdc = max(1.0, r_hi_rdc - r_lo_rdc + 1.0)
+            rdc_eff_pitch = native_pitch * (float(geom.n_rows) / active_rows_rdc)
+
+            ssrb_rdc_mid = rebin_series_ssrb_streaming(
+                files,
+                [z_mid],
+                geometry=geom,
+                angular_mode="short_scan",
+                active_row_range=(r_lo_rdc, r_hi_rdc),
+                workers=min(args.workers, 6),
+                show_progress=False,
+            )
+            fbp_rdc_raw = reconstruct_fanbeam_fbp(
+                ssrb_rdc_mid,
+                image_size=args.image_size,
+                fov_mm=fbp_ref.fov_mm,
+                water_mu_mm_inv=geom.water_mu_mm_inv,
+                filter_name=args.filter_name,
+                cutoff_ratio=args.cutoff_ratio,
+                inpaint_mode="none",
+                backend=args.backend,
+            )
+            fbp_rdc_inpaint = reconstruct_fanbeam_fbp(
+                ssrb_rdc_mid,
+                image_size=args.image_size,
+                fov_mm=fbp_ref.fov_mm,
+                water_mu_mm_inv=geom.water_mu_mm_inv,
+                filter_name=args.filter_name,
+                cutoff_ratio=args.cutoff_ratio,
+                inpaint_mode="conjugate_feather",
+                backend=args.backend,
+            )
+
+            rdc_raw_vs_ref = compute_reconstruction_metrics(
+                fbp_rdc_raw.hu_slices[0], ref_mid_hu, fov_mask=fbp_ref.fov_mask
+            )
+            rdc_inpaint_vs_ref = compute_reconstruction_metrics(
+                fbp_rdc_inpaint.hu_slices[0], ref_mid_hu, fov_mask=fbp_ref.fov_mask
+            )
+
+            vendor_slice_hu: np.ndarray | None = None
+            vendor_fov_mm: float | None = None
+            vendor_kernel: str | None = None
+            if idir is not None and idir.exists():
+                vol_data = read_ct_image_volume(idir, water_mu_mm_inv=geom.water_mu_mm_inv)
+                z_vol = vol_data["z_mm"]
+                if float(z_vol[0]) <= z_mid <= float(z_vol[-1]):
+                    v_idx_z = int(np.argmin(np.abs(z_vol - z_mid)))
+                else:
+                    frac = (z_mid - z_min_raw) / max(z_max_raw - z_min_raw, 1e-6)
+                    v_idx_z = int(np.clip(round(frac * (z_vol.size - 1)), 0, z_vol.size - 1))
+                vendor_slice_hu = vol_data["hu_volume"][v_idx_z]
+                ps_yx = vol_data["pixel_spacing_yx_mm"]
+                vendor_fov_mm = float(vol_data["shape_zyx"][2]) * float(ps_yx[1])
+                vendor_kernel = vol_data["convolution_kernel"] or None
+
+            qa_png = save_stage3_real_fbp_visual_qa(
+                figures_dir / f"stage3_{cid}_fbp_visual_qa.png",
+                case_id=cid,
+                z_slice_mm=z_mid,
+                native_pitch=native_pitch,
+                ref_fbp_hu=ref_mid_hu,
+                fov_mask=fbp_ref.fov_mask,
+                fov_mm=fbp_ref.fov_mm,
+                filter_name=fbp_ref.filter_name,
+                rdc_effective_pitch=rdc_eff_pitch,
+                rdc_raw_fbp_hu=fbp_rdc_raw.hu_slices[0],
+                rdc_inpaint_fbp_hu=fbp_rdc_inpaint.hu_slices[0],
+                rdc_vs_ref_metrics=rdc_inpaint_vs_ref,
+                rdc_raw_vs_ref_metrics=rdc_raw_vs_ref,
+                vendor_slice_hu=vendor_slice_hu,
+                vendor_fov_mm=vendor_fov_mm,
+                vendor_kernel=vendor_kernel,
+            )
+
+            finite_ok = bool(
+                np.all(np.isfinite(fbp_ref.mu_slices)) and np.all(np.isfinite(fbp_ref.hu_slices))
+            )
+            hu_fov = fbp_ref.hu_slices[:, fbp_ref.fov_mask]
+            hu_range_ok = bool(
+                hu_fov.size > 0
+                and float(np.min(hu_fov)) <= -850.0
+                and float(np.max(hu_fov)) >= 100.0
+            )
+            inpaint_improves_rdc = bool(
+                rdc_inpaint_vs_ref["rmse_hu"] <= rdc_raw_vs_ref["rmse_hu"]
+                if rdc_eff_pitch > 1.35
+                else True
+            )
+            series_pass = bool(finite_ok and hu_range_ok and inpaint_improves_rdc)
+            if not series_pass:
+                all_pass = False
+
+            entry = {
+                "case_id": cid,
+                "series_dir": str(pdir),
+                "native_normalized_pitch": round(native_pitch, 5),
+                "ffs_mode": geom.ffs_mode,
+                "series_pass": series_pass,
+                "finite_values_verified": finite_ok,
+                "physical_hu_range_verified": hu_range_ok,
+                "ssrb_measured_fraction": round(ssrb_ref.overall_measured_fraction, 6),
+                "reference_fbp_summary": fbp_ref.summary_dict(),
+                "mid_slice_high_pitch_rdc_ablation": {
+                    "z_mid_mm": round(z_mid, 4),
+                    "rdc_50pct_rows_range": [r_lo_rdc, r_hi_rdc],
+                    "rdc_effective_pitch": round(rdc_eff_pitch, 5),
+                    "rdc_measured_fraction": round(ssrb_rdc_mid.overall_measured_fraction, 6),
+                    "rdc_no_fill_vs_x_reference": rdc_raw_vs_ref,
+                    "rdc_conjugate_feather_vs_x_reference": rdc_inpaint_vs_ref,
+                    "conjugate_fill_rmse_reduction_hu": round(
+                        rdc_raw_vs_ref["rmse_hu"] - rdc_inpaint_vs_ref["rmse_hu"], 4
+                    ),
+                },
+                "visual_qa_png": str(qa_png),
+            }
+
+            if args.recon_out and idx_t == 0:
+                r_out = Path(args.recon_out).expanduser().resolve()
+                r_out.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    r_out,
+                    mu_slices=fbp_ref.mu_slices,
+                    hu_slices=fbp_ref.hu_slices,
+                    fov_mask=fbp_ref.fov_mask,
+                    z_slices_mm=fbp_ref.z_slices_mm,
+                    y_mm=fbp_ref.y_mm,
+                    x_mm=fbp_ref.x_mm,
+                    fov_mm=np.array(fbp_ref.fov_mm, dtype=np.float64),
+                    pixel_spacing_mm=np.array(fbp_ref.pixel_spacing_mm, dtype=np.float64),
+                    water_mu_mm_inv=np.array(fbp_ref.water_mu_mm_inv, dtype=np.float64),
+                    filter_name=np.array(fbp_ref.filter_name, dtype=np.str_),
+                )
+                entry["recon_npz"] = str(r_out)
+
+            reconstructed_series.append(entry)
+
+        phantom_stage3 = None
+        if args.run_phantom_check:
+            phantom_stage3 = _run_stage3_synthetic_phantom_check(figures_dir=figures_dir)
+            if not phantom_stage3["pass"]:
+                all_pass = False
+
+        report = {
+            "stage": "Stage 3 (v0.6.0)",
+            "overall_pass": all_pass,
+            "elapsed_seconds": round(time.monotonic() - t_start, 3),
+            "reconstructed_series_count": len(reconstructed_series),
+            "reconstructed_series": reconstructed_series,
+            "synthetic_phantom_fbp_check": phantom_stage3,
+        }
+        out_json = env_prof.data_root / "manifests" / "stage3_recon_report.json"
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
         report["report_json"] = str(out_json)
