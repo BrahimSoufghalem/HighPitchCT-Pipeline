@@ -19,6 +19,15 @@ from .ctpd_reader import (
     scan_projection_series,
     verify_projection_orientation,
 )
+from .forward_project import (
+    build_dual_domain_pair_from_ssrb,
+    compute_rdc_active_row_range,
+    forward_project_fanbeam_2d,
+    forward_project_fanbeam_2d_scalar_ref,
+    forward_project_helical_3d,
+    simulate_series_high_pitch_streaming,
+    synthesize_itf_helical_geometry,
+)
 from .index_dicom import index_dicom_tree
 from .manifest import read_series_manifest, write_series_manifest
 from .phantom import (
@@ -31,6 +40,7 @@ from .phantom import (
     write_synthetic_ctpd_series,
 )
 from .rebinning import (
+    SSRBResult,
     project_phantom_planar_fanbeam_2d,
     rebin_curved_to_flat,
     rebin_curved_to_flat_scalar_ref,
@@ -40,6 +50,7 @@ from .rebinning import (
 )
 from .recon_fbp import (
     compute_reconstruction_metrics,
+    normalize_filter_name,
     reconstruct_fanbeam_fbp,
     reconstruct_fanbeam_fbp_scalar_ref,
     reconstruct_series_reference_streaming,
@@ -53,6 +64,8 @@ from .visual_qa import (
     save_stage2_real_ssrb_visual_qa,
     save_stage3_phantom_fbp_visual_qa,
     save_stage3_real_fbp_visual_qa,
+    save_stage4_phantom_forward_visual_qa,
+    save_stage4_real_simulation_visual_qa,
 )
 
 
@@ -388,7 +401,7 @@ def _run_stage3_synthetic_phantom_check(
         image_size=192,
         fov_mm=340.0,
         water_mu_mm_inv=geom_w.water_mu_mm_inv,
-        filter_name="hann",
+        filter_name="ram_lak",
     )
     yy_w, xx_w = np.meshgrid(fbp_w.y_mm, fbp_w.x_mm, indexing="ij")
     roi_water = (xx_w * xx_w + yy_w * yy_w) <= (85.0 ** 2)
@@ -401,7 +414,7 @@ def _run_stage3_synthetic_phantom_check(
         image_size=32,
         fov_mm=340.0,
         water_mu_mm_inv=geom_w.water_mu_mm_inv,
-        filter_name="hann",
+        filter_name="ram_lak",
         lateral_pad_cols=32,
     )
     fbp_ref_small = reconstruct_fanbeam_fbp_scalar_ref(
@@ -409,7 +422,7 @@ def _run_stage3_synthetic_phantom_check(
         image_size=32,
         fov_mm=340.0,
         water_mu_mm_inv=geom_w.water_mu_mm_inv,
-        filter_name="hann",
+        filter_name="ram_lak",
         lateral_pad_cols=32,
     )
     scalar_max_hu_diff = float(np.max(np.abs(fbp_vec_small.hu_slices - fbp_ref_small.hu_slices)))
@@ -440,7 +453,7 @@ def _run_stage3_synthetic_phantom_check(
         image_size=256,
         fov_mm=360.0,
         water_mu_mm_inv=geom_low.water_mu_mm_inv,
-        filter_name="hann",
+        filter_name="ram_lak",
     )
 
     geom_high = make_synthetic_helical_geometry(
@@ -472,7 +485,7 @@ def _run_stage3_synthetic_phantom_check(
         image_size=256,
         fov_mm=360.0,
         water_mu_mm_inv=geom_high.water_mu_mm_inv,
-        filter_name="hann",
+        filter_name="ram_lak",
         inpaint_mode="none",
     )
     fbp_hp_inpaint = reconstruct_fanbeam_fbp(
@@ -480,7 +493,7 @@ def _run_stage3_synthetic_phantom_check(
         image_size=256,
         fov_mm=360.0,
         water_mu_mm_inv=geom_high.water_mu_mm_inv,
-        filter_name="hann",
+        filter_name="ram_lak",
         inpaint_mode="conjugate_feather",
     )
 
@@ -547,6 +560,7 @@ def _run_stage3_synthetic_phantom_check(
     return {
         "pass": overall_pass,
         "elapsed_seconds": round(time.monotonic() - t0, 3),
+        "filter_name": "ram_lak",
         "water_cylinder_calibration": {
             "mean_hu": round(water_mean_hu, 4),
             "std_hu": round(water_std_hu, 4),
@@ -566,6 +580,249 @@ def _run_stage3_synthetic_phantom_check(
         "thorax_phantom_pitch_0p85_vs_gt": ref_metrics,
         "thorax_phantom_pitch_1p85_raw_no_fill_vs_gt": hp_raw_metrics,
         "thorax_phantom_pitch_1p85_conjugate_fill_vs_gt": hp_inpaint_metrics,
+        "visual_qa_png": qa_png_str,
+    }
+
+
+def _run_stage4_synthetic_phantom_check(
+    *,
+    figures_dir: Path | None = None,
+    filter_name: str = "ram_lak",
+    backend: str = "numpy",
+) -> dict[str, Any]:
+    """Run Stage 4 synthetic verification: 2D scalar parity, Forward->FBP roundtrip, and RDC/ITF simulation."""
+    t0 = time.monotonic()
+    fname = normalize_filter_name(filter_name)
+
+    phantom = build_thorax_phantom(axial_scale=0.8)
+    z_test = -12.0
+    geom_low = make_synthetic_helical_geometry(
+        n_views=768,
+        n_rows=32,
+        n_cols=320,
+        angular_steps_per_rotation=384,
+        normalized_pitch=0.85,
+        detector_shape="CYLINDRICAL",
+        ffs_mode="FFSZ",
+        rotation_direction=-1,
+        quarter_detector_offset_cols=1.125,
+        du_mm=2.2,
+        dv_mm=1.8,
+        z_center_mm=z_test,
+    )
+
+    # 1. Level-2 Scalar Parity for 2D Fan-Beam Forward Projector on 32 x 32 slice
+    gt_small = voxelize_phantom_slices_radiological(
+        phantom,
+        z_slices_mm=[z_test],
+        image_size=32,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+    )
+    beta_small = np.linspace(0.0, np.pi + 0.5, 24, dtype=np.float64)
+    u_small = np.linspace(-180.0, 180.0, 48, dtype=np.float64)
+    sino_vec_small = forward_project_fanbeam_2d(
+        gt_small["mu_slices"][0],
+        beta_small,
+        u_small,
+        rho0_mm=geom_low.rho0_mm,
+        d0_mm=geom_low.d0_mm,
+        fov_mm=360.0,
+        backend="numpy",
+    )
+    sino_ref_small = forward_project_fanbeam_2d_scalar_ref(
+        gt_small["mu_slices"][0],
+        beta_small,
+        u_small,
+        rho0_mm=geom_low.rho0_mm,
+        d0_mm=geom_low.d0_mm,
+        fov_mm=360.0,
+    )
+    scalar_max_diff = float(np.max(np.abs(sino_vec_small - sino_ref_small)))
+
+    # 2. Level-3 2D Forward -> Ram-Lak FBP Self-Consistency Round-Trip on 192 x 192 slice
+    proj_low = project_phantom_helical(phantom, geom_low, batch_views=128, show_progress=False)
+    flat_low, valid_low = rebin_curved_to_flat(proj_low, geom_low)
+    ssrb_low = rebin_helical_ssrb(
+        flat_low, valid_low, geom_low, [z_test], angular_mode="short_scan"
+    )
+    gt_vox = voxelize_phantom_slices_radiological(
+        phantom,
+        z_slices_mm=[z_test],
+        image_size=192,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+    )
+    gt_mu = gt_vox["mu_slices"]
+    gt_hu = gt_vox["hu_slices"][0]
+
+    sino_rt = forward_project_fanbeam_2d(
+        gt_mu,
+        ssrb_low.beta_rad,
+        ssrb_low.u_coords_mm,
+        rho0_mm=ssrb_low.rho0_mm,
+        d0_mm=ssrb_low.d0_mm,
+        fov_mm=360.0,
+        backend=backend,
+    )
+    ssrb_rt = SSRBResult(
+        sinograms=sino_rt,
+        measured_mask=np.ones_like(sino_rt, dtype=bool),
+        z_slices_mm=ssrb_low.z_slices_mm.copy(),
+        beta_rad=ssrb_low.beta_rad.copy(),
+        phi_center_rad=ssrb_low.phi_center_rad.copy(),
+        u_coords_mm=ssrb_low.u_coords_mm.copy(),
+        du_mm=ssrb_low.du_mm,
+        rho0_mm=ssrb_low.rho0_mm,
+        d0_mm=ssrb_low.d0_mm,
+        gamma_max_rad=ssrb_low.gamma_max_rad,
+        angular_mode=ssrb_low.angular_mode,
+        angular_span_rad=ssrb_low.angular_span_rad,
+        active_row_range=ssrb_low.active_row_range,
+    )
+    fbp_rt = reconstruct_fanbeam_fbp(
+        ssrb_rt,
+        image_size=192,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+        filter_name=fname,
+        backend=backend,
+    )
+    rt_metrics = compute_reconstruction_metrics(
+        fbp_rt.hu_slices[0], gt_hu, fov_mask=fbp_rt.fov_mask
+    )
+
+    # 3. High-Pitch RDC (target_pitch = 2.4) & ITF (target_pitch = 2.4 via 3D Helical Forward Projection)
+    r_lo_rdc, r_hi_rdc, eff_rdc_pitch = compute_rdc_active_row_range(
+        geom_low.n_rows, 0.85, 2.4
+    )
+    ssrb_rdc = rebin_helical_ssrb(
+        flat_low,
+        valid_low,
+        geom_low,
+        [z_test],
+        angular_mode="short_scan",
+        active_row_range=(r_lo_rdc, r_hi_rdc),
+    )
+    pair_rdc = build_dual_domain_pair_from_ssrb(
+        ssrb_low,
+        ssrb_rdc,
+        scenario="rdc",
+        target_pitch=2.4,
+        effective_pitch=eff_rdc_pitch,
+        native_pitch=0.85,
+        active_row_range=(r_lo_rdc, r_hi_rdc),
+        image_size=192,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+        filter_name=fname,
+        backend=backend,
+    )
+
+    # 3D Helical Forward Projection for ITF (target_pitch = 2.4)
+    z_slab = np.linspace(z_test - 35.0, z_test + 35.0, 9, dtype=np.float64)
+    slab_vox = voxelize_phantom_slices_radiological(
+        phantom,
+        z_slices_mm=z_slab,
+        image_size=128,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+    )
+    geom_base_itf = make_synthetic_helical_geometry(
+        n_views=384,
+        n_rows=32,
+        n_cols=160,
+        angular_steps_per_rotation=192,
+        normalized_pitch=0.85,
+        detector_shape="CYLINDRICAL",
+        ffs_mode="FFSZ",
+        rotation_direction=-1,
+        quarter_detector_offset_cols=1.125,
+        du_mm=4.4,
+        dv_mm=1.8,
+        z_center_mm=z_test,
+    )
+    proj_base_itf = project_phantom_helical(
+        phantom, geom_base_itf, batch_views=128, show_progress=False
+    )
+    flat_base_itf, valid_base_itf = rebin_curved_to_flat(proj_base_itf, geom_base_itf)
+    ssrb_base_itf = rebin_helical_ssrb(
+        flat_base_itf, valid_base_itf, geom_base_itf, [z_test], angular_mode="short_scan"
+    )
+    geom_itf = synthesize_itf_helical_geometry(
+        geom_base_itf, 2.4, z_center_mm=z_test, z_span_mm=10.0, min_rotations=1.0
+    )
+    proj_itf = forward_project_helical_3d(
+        slab_vox["mu_slices"],
+        z_slab,
+        slab_vox["y_mm"],
+        slab_vox["x_mm"],
+        geom_itf,
+        step_mm=3.0,
+        z_boundary_mode="clamp",
+        backend=backend,
+    )
+    flat_itf, valid_itf = rebin_curved_to_flat(proj_itf, geom_itf)
+    ssrb_itf = rebin_helical_ssrb(
+        flat_itf, valid_itf, geom_itf, [z_test], angular_mode="short_scan"
+    )
+    eff_itf_pitch = float(geom_itf.trajectory_metrics()["normalized_pitch"])
+    pair_itf = build_dual_domain_pair_from_ssrb(
+        ssrb_base_itf,
+        ssrb_itf,
+        scenario="itf",
+        target_pitch=2.4,
+        effective_pitch=eff_itf_pitch,
+        native_pitch=0.85,
+        active_row_range=(0.0, float(geom_itf.n_rows - 1)),
+        image_size=192,
+        fov_mm=360.0,
+        water_mu_mm_inv=geom_low.water_mu_mm_inv,
+        filter_name=fname,
+        backend=backend,
+    )
+
+    qa_png_str: str | None = None
+    if figures_dir is not None:
+        qa_png = save_stage4_phantom_forward_visual_qa(
+            figures_dir / "stage4_phantom_forward_visual_qa.png",
+            gt_hu=gt_hu,
+            roundtrip_fbp_hu=fbp_rt.hu_slices[0],
+            roundtrip_metrics=rt_metrics,
+            s_hp_raw=pair_rdc.s_hp_raw[0],
+            mask_hp=pair_rdc.mask_hp[0],
+            s_reproj=pair_rdc.s_reproj[0],
+            rdc_prelim_hu=pair_rdc.x_prelim_hu[0],
+            rdc_metrics=pair_rdc.prelim_vs_target_metrics,
+            rdc_pitch=pair_rdc.effective_pitch,
+            itf_prelim_hu=pair_itf.x_prelim_hu[0],
+            itf_metrics=pair_itf.prelim_vs_target_metrics,
+            itf_pitch=pair_itf.effective_pitch,
+            fov_mm=360.0,
+            z_slice_mm=z_test,
+            filter_name=fname,
+        )
+        qa_png_str = str(qa_png)
+
+    overall_pass = bool(
+        scalar_max_diff < 1e-5
+        and rt_metrics["ssim"] >= 0.88
+        and pair_rdc.prelim_vs_target_metrics["rmse_hu"] < pair_rdc.raw_nofill_vs_target_metrics["rmse_hu"]
+        and pair_rdc.sinogram_metrics["reproj_missing_wedge_mae"]
+        < pair_rdc.sinogram_metrics["raw_missing_wedge_mae"]
+        and pair_itf.prelim_vs_target_metrics["rmse_hu"] < pair_itf.raw_nofill_vs_target_metrics["rmse_hu"]
+    )
+    return {
+        "pass": overall_pass,
+        "elapsed_seconds": round(time.monotonic() - t0, 3),
+        "filter_name": fname,
+        "scalar_parity_2d_forward": {
+            "max_abs_line_integral_diff": round(scalar_max_diff, 8),
+            "pass": bool(scalar_max_diff < 1e-5),
+        },
+        "forward_to_fbp_roundtrip_vs_gt": rt_metrics,
+        "rdc_simulation_summary": pair_rdc.summary_dict(),
+        "itf_3d_helical_simulation_summary": pair_itf.summary_dict(),
         "visual_qa_png": qa_png_str,
     }
 
@@ -752,6 +1009,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage3.add_argument(
         "--image-size",
+        "--n-xy",
+        dest="image_size",
         type=int,
         default=512,
         help="Reconstructed axial matrix size H = W (default: 512)",
@@ -760,15 +1019,15 @@ def _parser() -> argparse.ArgumentParser:
         "--fov-mm",
         type=float,
         default=None,
-        help="Reconstruction FOV diameter [mm] (default: scanner non-truncated FOV 2*rho0*sin(gamma_max))",
+        help="Reconstruction FOV diameter [mm] (default: matched to paired Vendor CT FOV or 2*rho0*sin(gamma_max))",
     )
     stage3.add_argument(
         "--filter",
         "--filter-name",
         dest="filter_name",
-        choices=["ramp", "shepp_logan", "cosine", "hamming", "hann"],
-        default="hann",
-        help="Ramp apodization filter (default: hann)",
+        choices=["ram_lak", "ram-lak", "ramp", "shepp_logan", "cosine", "hamming", "hann"],
+        default="ram_lak",
+        help="FBP frequency filter (default: ram_lak)",
     )
     stage3.add_argument(
         "--cutoff-ratio",
@@ -810,6 +1069,103 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage3.add_argument("--workers", type=int, default=8)
     stage3.add_argument("--no-progress", action="store_true")
+
+    stage4 = sub.add_parser(
+        "stage4-sim",
+        help="Stage 4 2D/3D Forward Projection + High-Pitch (RDC & ITF) Simulation + Fig. 2(d) Reprojection & Visual QA",
+    )
+    stage4.add_argument("--data-root", help="Writable root containing raw/tcia and manifests/")
+    stage4.add_argument(
+        "--case-id",
+        help="Optional patient case filter under raw/tcia (matches C012 or case_C012)",
+    )
+    stage4.add_argument("--series-dir", help="Explicit DICOM-CT-PD projection directory to simulate")
+    stage4.add_argument("--image-dir", help="Optional published CT image directory for FOV matching")
+    stage4.add_argument(
+        "--scenario",
+        choices=["rdc", "itf", "both"],
+        default="both",
+        help="High-pitch simulation scenario: rdc (Fig. 1b), itf (Fig. 1c), or both (default: both)",
+    )
+    stage4.add_argument(
+        "--target-pitch",
+        type=float,
+        default=3.2,
+        help="Primary high-pitch factor to simulate for Visual QA and .npz export (default: 3.2)",
+    )
+    stage4.add_argument(
+        "--pitches",
+        default="2.4,3.2,4.8",
+        help="Comma-separated list of RDC target pitches to benchmark in report (default: 2.4,3.2,4.8)",
+    )
+    stage4.add_argument(
+        "--num-slices",
+        type=int,
+        default=1,
+        help="Number of interior axial z slices to simulate (default: 1)",
+    )
+    stage4.add_argument(
+        "--image-size",
+        "--n-xy",
+        dest="image_size",
+        type=int,
+        default=256,
+        help="Reconstructed axial matrix size H = W (default: 256)",
+    )
+    stage4.add_argument(
+        "--fov-mm",
+        type=float,
+        default=None,
+        help="Reconstruction FOV diameter [mm] (default: matched to paired Vendor CT FOV or scanner FOV)",
+    )
+    stage4.add_argument(
+        "--filter",
+        "--filter-name",
+        dest="filter_name",
+        choices=["ram_lak", "ram-lak", "ramp", "shepp_logan", "cosine", "hamming", "hann"],
+        default="ram_lak",
+        help="FBP frequency filter (default: ram_lak)",
+    )
+    stage4.add_argument(
+        "--cutoff-ratio",
+        type=float,
+        default=1.0,
+        help="Normalized Nyquist frequency cutoff in (0, 1] (default: 1.0)",
+    )
+    stage4.add_argument(
+        "--inpaint-mode",
+        choices=["conjugate_feather", "angular_feather", "none"],
+        default="conjugate_feather",
+        help="High-pitch missing-wedge completion strategy (default: conjugate_feather)",
+    )
+    stage4.add_argument(
+        "--itf-slab-slices",
+        type=int,
+        default=7,
+        help="Number of axial reference slices in the 3D slab for ITF helical forward projection (default: 7)",
+    )
+    stage4.add_argument(
+        "--backend",
+        choices=["numpy", "torch", "torch_cuda"],
+        default="numpy",
+        help="Forward/backprojection execution backend (default: numpy; torch_cuda requires GPU without fallback)",
+    )
+    stage4.add_argument(
+        "--pairs-out",
+        help="Optional compressed .npz path to save Dual-Domain training/evaluation arrays",
+    )
+    stage4.add_argument(
+        "--save-pairs-npz",
+        action="store_true",
+        help="Automatically save simulated pairs to <data-root>/manifests/stage4_<case_id>_pairs.npz",
+    )
+    stage4.add_argument(
+        "--run-phantom-check",
+        action="store_true",
+        help="Run Stage 4 synthetic verification (2D scalar parity + Forward->FBP roundtrip + RDC/ITF QA)",
+    )
+    stage4.add_argument("--workers", type=int, default=8)
+    stage4.add_argument("--no-progress", action="store_true")
 
     environment = sub.add_parser(
         "env", help="Report Kaggle/Full profile, disk quota, RAM, disk space, and GPUs"
@@ -1289,6 +1645,7 @@ def main(argv: list[str] | None = None) -> int:
         show_prog = not args.no_progress
         figures_dir = env_prof.data_root / "manifests" / "figures"
         figures_dir.mkdir(parents=True, exist_ok=True)
+        fname = normalize_filter_name(args.filter_name)
 
         targets = _resolve_cli_series_targets(
             env_prof.data_root / "raw" / "tcia",
@@ -1323,14 +1680,30 @@ def main(argv: list[str] | None = None) -> int:
                     dtype=np.float64,
                 )
 
+            # Pre-read paired Vendor CT volume (if available) to match its clinical FOV (`400.0 mm`)
+            vol_data: dict[str, Any] | None = None
+            vendor_fov_mm: float | None = None
+            vendor_kernel: str | None = None
+            if idir is not None and idir.exists():
+                vol_data = read_ct_image_volume(idir, water_mu_mm_inv=geom.water_mu_mm_inv)
+                ps_yx = vol_data["pixel_spacing_yx_mm"]
+                vendor_fov_mm = float(vol_data["shape_zyx"][2]) * float(ps_yx[1])
+                vendor_kernel = vol_data["convolution_kernel"] or None
+
+            effective_fov_mm = (
+                args.fov_mm
+                if args.fov_mm is not None
+                else (vendor_fov_mm if vendor_fov_mm is not None and vendor_fov_mm > 0.0 else None)
+            )
+
             ssrb_ref, fbp_ref = reconstruct_series_reference_streaming(
                 files,
                 z_slices,
                 geometry=geom,
                 angular_mode=args.angular_mode,
                 image_size=args.image_size,
-                fov_mm=args.fov_mm,
-                filter_name=args.filter_name,
+                fov_mm=effective_fov_mm,
+                filter_name=fname,
                 cutoff_ratio=args.cutoff_ratio,
                 inpaint_mode=args.inpaint_mode,
                 backend=args.backend,
@@ -1362,7 +1735,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_size=args.image_size,
                 fov_mm=fbp_ref.fov_mm,
                 water_mu_mm_inv=geom.water_mu_mm_inv,
-                filter_name=args.filter_name,
+                filter_name=fname,
                 cutoff_ratio=args.cutoff_ratio,
                 inpaint_mode="none",
                 backend=args.backend,
@@ -1372,7 +1745,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_size=args.image_size,
                 fov_mm=fbp_ref.fov_mm,
                 water_mu_mm_inv=geom.water_mu_mm_inv,
-                filter_name=args.filter_name,
+                filter_name=fname,
                 cutoff_ratio=args.cutoff_ratio,
                 inpaint_mode="conjugate_feather",
                 backend=args.backend,
@@ -1386,10 +1759,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             vendor_slice_hu: np.ndarray | None = None
-            vendor_fov_mm: float | None = None
-            vendor_kernel: str | None = None
-            if idir is not None and idir.exists():
-                vol_data = read_ct_image_volume(idir, water_mu_mm_inv=geom.water_mu_mm_inv)
+            if vol_data is not None:
                 z_vol = vol_data["z_mm"]
                 if float(z_vol[0]) <= z_mid <= float(z_vol[-1]):
                     v_idx_z = int(np.argmin(np.abs(z_vol - z_mid)))
@@ -1397,9 +1767,6 @@ def main(argv: list[str] | None = None) -> int:
                     frac = (z_mid - z_min_raw) / max(z_max_raw - z_min_raw, 1e-6)
                     v_idx_z = int(np.clip(round(frac * (z_vol.size - 1)), 0, z_vol.size - 1))
                 vendor_slice_hu = vol_data["hu_volume"][v_idx_z]
-                ps_yx = vol_data["pixel_spacing_yx_mm"]
-                vendor_fov_mm = float(vol_data["shape_zyx"][2]) * float(ps_yx[1])
-                vendor_kernel = vol_data["convolution_kernel"] or None
 
             qa_png = save_stage3_real_fbp_visual_qa(
                 figures_dir / f"stage3_{cid}_fbp_visual_qa.png",
@@ -1494,7 +1861,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 3 (v0.6.0)",
+            "stage": "Stage 3 (v0.7.0)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "reconstructed_series_count": len(reconstructed_series),
@@ -1502,6 +1869,255 @@ def main(argv: list[str] | None = None) -> int:
             "synthetic_phantom_fbp_check": phantom_stage3,
         }
         out_json = env_prof.data_root / "manifests" / "stage3_recon_report.json"
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report["report_json"] = str(out_json)
+        print(json.dumps(report, indent=2))
+        return 0 if all_pass else 1
+
+    if args.command == "stage4-sim":
+        if args.workers < 1:
+            raise SystemExit("--workers must be at least 1")
+        if args.num_slices < 1:
+            raise SystemExit("--num-slices must be at least 1")
+        if args.image_size < 16:
+            raise SystemExit("--image-size must be at least 16")
+        if args.target_pitch <= 0.0:
+            raise SystemExit("--target-pitch must be positive")
+
+        t_start = time.monotonic()
+        env_prof = resolve_environment_profile(data_root=args.data_root)
+        show_prog = not args.no_progress
+        figures_dir = env_prof.data_root / "manifests" / "figures"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        fname = normalize_filter_name(args.filter_name)
+
+        pitch_list = sorted(
+            {
+                float(x.strip())
+                for x in str(args.pitches).split(",")
+                if x.strip()
+            }
+            | {float(args.target_pitch)}
+        )
+
+        targets = _resolve_cli_series_targets(
+            env_prof.data_root / "raw" / "tcia",
+            case_id=args.case_id,
+            series_dir=args.series_dir,
+            image_dir=args.image_dir,
+            allow_empty_for_phantom=bool(args.run_phantom_check),
+        )
+
+        simulated_series: list[dict[str, Any]] = []
+        all_pass = True
+
+        for idx_t, (cid, pdir, idir) in enumerate(targets):
+            geom, files = scan_projection_series(
+                pdir, workers=args.workers, show_progress=show_prog
+            )
+            traj = geom.trajectory_metrics()
+            native_pitch = float(traj["normalized_pitch"])
+            z_min_raw = float(np.min(geom.z0_mm))
+            z_max_raw = float(np.max(geom.z0_mm))
+            margin_mm = min(
+                1.5 * geom.coverage_isocenter_mm,
+                0.25 * max(0.0, z_max_raw - z_min_raw),
+            )
+            if args.num_slices == 1:
+                z_slices = np.array([0.5 * (z_min_raw + z_max_raw)], dtype=np.float64)
+            else:
+                z_slices = np.linspace(
+                    z_min_raw + margin_mm,
+                    z_max_raw - margin_mm,
+                    args.num_slices,
+                    dtype=np.float64,
+                )
+
+            vendor_fov_mm: float | None = None
+            if idir is not None and idir.exists():
+                vol_data = read_ct_image_volume(idir, water_mu_mm_inv=geom.water_mu_mm_inv)
+                ps_yx = vol_data["pixel_spacing_yx_mm"]
+                vendor_fov_mm = float(vol_data["shape_zyx"][2]) * float(ps_yx[1])
+
+            effective_fov_mm = (
+                args.fov_mm
+                if args.fov_mm is not None
+                else (vendor_fov_mm if vendor_fov_mm is not None and vendor_fov_mm > 0.0 else None)
+            )
+
+            # Reconstruct shared low-pitch reference target (s*, x*) once
+            ssrb_ref, fbp_ref = reconstruct_series_reference_streaming(
+                files,
+                z_slices,
+                geometry=geom,
+                angular_mode="short_scan",
+                image_size=args.image_size,
+                fov_mm=effective_fov_mm,
+                filter_name=fname,
+                cutoff_ratio=args.cutoff_ratio,
+                inpaint_mode="conjugate_feather",
+                backend=args.backend,
+                workers=min(args.workers, 6),
+                show_progress=show_prog,
+            )
+
+            rdc_multi_pitch_summary: dict[str, Any] = {}
+            primary_rdc_pair = None
+            primary_itf_pair = None
+
+            if args.scenario in {"rdc", "both"}:
+                for p_val in pitch_list:
+                    pair_p = simulate_series_high_pitch_streaming(
+                        files,
+                        z_slices,
+                        geometry=geom,
+                        scenario="rdc",
+                        target_pitch=p_val,
+                        image_size=args.image_size,
+                        fov_mm=fbp_ref.fov_mm,
+                        filter_name=fname,
+                        cutoff_ratio=args.cutoff_ratio,
+                        inpaint_mode=args.inpaint_mode,
+                        backend=args.backend,
+                        workers=min(args.workers, 6),
+                        ssrb_ref_precomputed=ssrb_ref,
+                        fbp_ref_precomputed=fbp_ref,
+                        show_progress=False,
+                    )
+                    rdc_multi_pitch_summary[f"p_{p_val:.1f}"] = pair_p.summary_dict()
+                    if abs(p_val - float(args.target_pitch)) < 1e-4 or primary_rdc_pair is None:
+                        primary_rdc_pair = pair_p
+
+            if args.scenario in {"itf", "both"}:
+                primary_itf_pair = simulate_series_high_pitch_streaming(
+                    files,
+                    z_slices,
+                    geometry=geom,
+                    scenario="itf",
+                    target_pitch=float(args.target_pitch),
+                    image_size=args.image_size,
+                    fov_mm=fbp_ref.fov_mm,
+                    filter_name=fname,
+                    cutoff_ratio=args.cutoff_ratio,
+                    inpaint_mode=args.inpaint_mode,
+                    backend=args.backend,
+                    itf_slab_slices=args.itf_slab_slices,
+                    workers=min(args.workers, 6),
+                    ssrb_ref_precomputed=ssrb_ref,
+                    fbp_ref_precomputed=fbp_ref,
+                    show_progress=show_prog,
+                )
+
+            pair_for_rdc_panel = primary_rdc_pair if primary_rdc_pair is not None else primary_itf_pair
+            pair_for_itf_panel = primary_itf_pair if primary_itf_pair is not None else primary_rdc_pair
+            assert pair_for_rdc_panel is not None and pair_for_itf_panel is not None
+
+            mid_idx = len(z_slices) // 2
+            qa_png = save_stage4_real_simulation_visual_qa(
+                figures_dir / f"stage4_{cid}_rdc_itf_visual_qa.png",
+                case_id=cid,
+                z_slice_mm=float(z_slices[mid_idx]),
+                native_pitch=native_pitch,
+                fov_mm=fbp_ref.fov_mm,
+                fov_mask=fbp_ref.fov_mask,
+                filter_name=fname,
+                x_target_hu=fbp_ref.hu_slices[mid_idx],
+                s_target=pair_for_rdc_panel.s_target[mid_idx],
+                s_hp_raw=pair_for_rdc_panel.s_hp_raw[mid_idx],
+                mask_hp=pair_for_rdc_panel.mask_hp[mid_idx],
+                s_reproj=pair_for_rdc_panel.s_reproj[mid_idx],
+                rdc_pitch=pair_for_rdc_panel.effective_pitch,
+                rdc_prelim_hu=pair_for_rdc_panel.x_prelim_hu[mid_idx],
+                rdc_metrics=pair_for_rdc_panel.prelim_vs_target_metrics,
+                itf_pitch=pair_for_itf_panel.effective_pitch,
+                itf_prelim_hu=pair_for_itf_panel.x_prelim_hu[mid_idx],
+                itf_metrics=pair_for_itf_panel.prelim_vs_target_metrics,
+            )
+
+            series_pass = True
+            for pair_chk in (primary_rdc_pair, primary_itf_pair):
+                if pair_chk is not None:
+                    if not (
+                        np.all(np.isfinite(pair_chk.s_reproj))
+                        and np.all(np.isfinite(pair_chk.x_prelim_hu))
+                        and pair_chk.prelim_vs_target_metrics["rmse_hu"]
+                        <= pair_chk.raw_nofill_vs_target_metrics["rmse_hu"]
+                    ):
+                        series_pass = False
+            if not series_pass:
+                all_pass = False
+
+            entry = {
+                "case_id": cid,
+                "series_dir": str(pdir),
+                "native_normalized_pitch": round(native_pitch, 5),
+                "fov_mm": round(float(fbp_ref.fov_mm), 4),
+                "filter_name": fname,
+                "series_pass": series_pass,
+                "rdc_multi_pitch_summary": rdc_multi_pitch_summary,
+                "primary_rdc_summary": (
+                    primary_rdc_pair.summary_dict() if primary_rdc_pair is not None else None
+                ),
+                "primary_itf_summary": (
+                    primary_itf_pair.summary_dict() if primary_itf_pair is not None else None
+                ),
+                "visual_qa_png": str(qa_png),
+            }
+
+            target_npz_out: Path | None = None
+            if args.pairs_out and idx_t == 0:
+                target_npz_out = Path(args.pairs_out).expanduser().resolve()
+            elif getattr(args, "save_pairs_npz", False):
+                target_npz_out = env_prof.data_root / "manifests" / f"stage4_{cid}_pairs.npz"
+
+            if target_npz_out is not None:
+                target_npz_out.parent.mkdir(parents=True, exist_ok=True)
+                active_pair = primary_rdc_pair if primary_rdc_pair is not None else primary_itf_pair
+                assert active_pair is not None
+                np.savez_compressed(
+                    target_npz_out,
+                    s_target=active_pair.s_target,
+                    s_hp_raw=active_pair.s_hp_raw,
+                    mask_hp=active_pair.mask_hp,
+                    s_reproj=active_pair.s_reproj,
+                    s_reproj_dc=active_pair.s_reproj_dc,
+                    x_target_hu=active_pair.x_target_hu,
+                    mu_target=active_pair.mu_target,
+                    x_prelim_hu=active_pair.x_prelim_hu,
+                    mu_prelim=active_pair.mu_prelim,
+                    fov_mask=active_pair.fov_mask,
+                    z_slices_mm=active_pair.z_slices_mm,
+                    y_mm=active_pair.y_mm,
+                    x_mm=active_pair.x_mm,
+                    beta_rad=active_pair.beta_rad,
+                    u_coords_mm=active_pair.u_coords_mm,
+                    fov_mm=np.array(active_pair.fov_mm, dtype=np.float64),
+                    filter_name=np.array(active_pair.filter_name, dtype=np.str_),
+                )
+                entry["pairs_npz"] = str(target_npz_out)
+
+            simulated_series.append(entry)
+
+        phantom_stage4 = None
+        if args.run_phantom_check:
+            phantom_stage4 = _run_stage4_synthetic_phantom_check(
+                figures_dir=figures_dir,
+                filter_name=fname,
+                backend=args.backend,
+            )
+            if not phantom_stage4["pass"]:
+                all_pass = False
+
+        report = {
+            "stage": "Stage 4 (v0.7.0)",
+            "overall_pass": all_pass,
+            "elapsed_seconds": round(time.monotonic() - t_start, 3),
+            "simulated_series_count": len(simulated_series),
+            "simulated_series": simulated_series,
+            "synthetic_phantom_forward_check": phantom_stage4,
+        }
+        out_json = env_prof.data_root / "manifests" / "stage4_sim_report.json"
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
         report["report_json"] = str(out_json)

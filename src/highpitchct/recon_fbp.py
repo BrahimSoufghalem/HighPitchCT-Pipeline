@@ -41,9 +41,23 @@ from .geometry import HelicalGeometry
 from .progress import ProgressReporter
 from .rebinning import SUPPORTED_ANGULAR_MODES, SSRBResult, rebin_series_ssrb_streaming
 
-SUPPORTED_FILTER_NAMES = frozenset({"ramp", "shepp_logan", "cosine", "hamming", "hann"})
+SUPPORTED_FILTER_NAMES = frozenset(
+    {"ram_lak", "ram-lak", "ramp", "shepp_logan", "cosine", "hamming", "hann"}
+)
 SUPPORTED_INPAINT_MODES = frozenset({"conjugate_feather", "angular_feather", "none"})
 SUPPORTED_FBP_BACKENDS = frozenset({"numpy", "torch", "torch_cuda"})
+
+
+def normalize_filter_name(filter_name: str) -> str:
+    """Validate and normalize FBP ramp filter name (`ram_lak` / `ram-lak` / `ramp` -> `ram_lak`)."""
+    fname = filter_name.strip().lower()
+    if fname not in SUPPORTED_FILTER_NAMES:
+        raise ValueError(
+            f"Unsupported filter_name={filter_name!r}; expected one of {sorted(SUPPORTED_FILTER_NAMES)}"
+        )
+    if fname in {"ram_lak", "ram-lak", "ramp"}:
+        return "ram_lak"
+    return fname
 
 
 def _next_power_of_two(n: int) -> int:
@@ -456,7 +470,7 @@ def build_fbp_filter_kernel_rfft(
     n_fft: int,
     du_iso_mm: float,
     *,
-    filter_name: str = "hann",
+    filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
 ) -> np.ndarray:
     """Build exact spatial-domain Kak & Slaney discrete ramp filter in `rfft` domain `[mm^-1]`.
@@ -466,11 +480,7 @@ def build_fbp_filter_kernel_rfft(
     DC bias is strictly zero (avoiding the ~-10 HU cupping bias of naive `|fftfreq|`),
     multiplied by a smooth frequency apodization window with `W(0) = 1`.
     """
-    fname = filter_name.strip().lower()
-    if fname not in SUPPORTED_FILTER_NAMES:
-        raise ValueError(
-            f"Unsupported filter_name={filter_name!r}; expected one of {sorted(SUPPORTED_FILTER_NAMES)}"
-        )
+    fname = normalize_filter_name(filter_name)
     if int(n_fft) < 4 or (int(n_fft) % 2) != 0:
         raise ValueError(f"n_fft must be an even integer >= 4, got {n_fft}")
     if float(du_iso_mm) <= 0.0:
@@ -498,7 +508,7 @@ def build_fbp_filter_kernel_rfft(
     within_cut = f_scaled <= 1.0
     fc = np.clip(f_scaled, 0.0, 1.0)
 
-    if fname == "ramp":
+    if fname == "ram_lak":
         win = np.ones_like(fc)
     elif fname == "shepp_logan":
         # np.sinc(x) computes sin(pi * x) / (pi * x)
@@ -521,7 +531,7 @@ def filter_weighted_sinogram_2d(
     weighted_sino_2d: np.ndarray,
     *,
     du_iso_mm: float,
-    filter_name: str = "hann",
+    filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     lateral_pad_cols: int = 96,
 ) -> np.ndarray:
@@ -714,7 +724,7 @@ def reconstruct_fanbeam_fbp(
     fov_mm: float | None = None,
     center_xy_mm: tuple[float, float] = (0.0, 0.0),
     water_mu_mm_inv: float = 0.0192,
-    filter_name: str = "hann",
+    filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     inpaint_mode: str = "conjugate_feather",
     lateral_pad_cols: int = 96,
@@ -730,6 +740,7 @@ def reconstruct_fanbeam_fbp(
     if float(water_mu_mm_inv) <= 0.0:
         raise ValueError(f"water_mu_mm_inv must be positive, got {water_mu_mm_inv}")
 
+    fname = normalize_filter_name(filter_name)
     backend_norm = backend.strip().lower()
     if backend_norm not in SUPPORTED_FBP_BACKENDS:
         raise ValueError(
@@ -748,12 +759,18 @@ def reconstruct_fanbeam_fbp(
     #   and -x is Patient Left (Heart). Standard radiological viewing (feet-to-head) places:
     #   Col 0 -> +x (Patient Right), Col W-1 -> -x (Patient Left)
     #   Row 0 -> +y (Anterior / Sternum), Row H-1 -> -y (Posterior / Spine & Table)
-    x_mm = float(center_xy_mm[0]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
-    y_mm = float(center_xy_mm[1]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
+    cx = float(center_xy_mm[0])
+    cy = float(center_xy_mm[1])
+    x_mm = cx + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
+    y_mm = cy + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
 
     yy_grid, xx_grid = np.meshgrid(y_mm, x_mm, indexing="ij")
-    r_max_recon = min(0.5 * active_fov, 0.5 * scanner_fov)
-    fov_mask = ((xx_grid * xx_grid) + (yy_grid * yy_grid)) <= (r_max_recon * r_max_recon)
+    r_recon = 0.5 * active_fov
+    r_scan = 0.5 * scanner_fov
+    fov_mask = (
+        (((xx_grid - cx) ** 2 + (yy_grid - cy) ** 2) <= (r_recon * r_recon))
+        & (((xx_grid * xx_grid) + (yy_grid * yy_grid)) <= (r_scan * r_scan))
+    )
     fov_iy, fov_ix = np.where(fov_mask)
     x_fov = xx_grid[fov_iy, fov_ix]
     y_fov = yy_grid[fov_iy, fov_ix]
@@ -796,7 +813,7 @@ def reconstruct_fanbeam_fbp(
             q_filtered = filter_weighted_sinogram_2d(
                 g_weighted,
                 du_iso_mm=du_iso,
-                filter_name=filter_name,
+                filter_name=fname,
                 cutoff_ratio=cutoff_ratio,
                 lateral_pad_cols=lateral_pad_cols,
             )
@@ -849,9 +866,9 @@ def reconstruct_fanbeam_fbp(
         x_mm=x_mm,
         fov_mm=active_fov,
         pixel_spacing_mm=d_xy,
-        center_xy_mm=(float(center_xy_mm[0]), float(center_xy_mm[1])),
+        center_xy_mm=(cx, cy),
         water_mu_mm_inv=float(water_mu_mm_inv),
-        filter_name=filter_name.strip().lower(),
+        filter_name=fname,
         cutoff_ratio=float(cutoff_ratio),
         inpaint_mode=prep.inpaint_mode,
         lateral_pad_cols=int(lateral_pad_cols),
@@ -868,24 +885,31 @@ def reconstruct_fanbeam_fbp_scalar_ref(
     fov_mm: float | None = None,
     center_xy_mm: tuple[float, float] = (0.0, 0.0),
     water_mu_mm_inv: float = 0.0192,
-    filter_name: str = "hann",
+    filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     inpaint_mode: str = "conjugate_feather",
     lateral_pad_cols: int = 32,
     min_hu_clip: float | None = -1024.0,
 ) -> FBPReconstructionResult:
     """Explicit scalar loop reference for Fan-Beam FBP parity verification (`validation_protocol.md`)."""
+    fname = normalize_filter_name(filter_name)
     n_xy = int(image_size)
     scanner_fov = default_scanner_fov_mm(ssrb_result.rho0_mm, ssrb_result.gamma_max_rad)
     active_fov = scanner_fov if fov_mm is None else float(fov_mm)
     d_xy = active_fov / float(n_xy)
     half_idx = 0.5 * (n_xy - 1.0)
-    x_mm = float(center_xy_mm[0]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
-    y_mm = float(center_xy_mm[1]) + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
+    cx = float(center_xy_mm[0])
+    cy = float(center_xy_mm[1])
+    x_mm = cx + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
+    y_mm = cy + (half_idx - np.arange(n_xy, dtype=np.float64)) * d_xy
 
-    r_max_recon = min(0.5 * active_fov, 0.5 * scanner_fov)
+    r_recon = 0.5 * active_fov
+    r_scan = 0.5 * scanner_fov
     yy_grid, xx_grid = np.meshgrid(y_mm, x_mm, indexing="ij")
-    fov_mask = ((xx_grid * xx_grid) + (yy_grid * yy_grid)) <= (r_max_recon * r_max_recon)
+    fov_mask = (
+        (((xx_grid - cx) ** 2 + (yy_grid - cy) ** 2) <= (r_recon * r_recon))
+        & (((xx_grid * xx_grid) + (yy_grid * yy_grid)) <= (r_scan * r_scan))
+    )
 
     prep = extrapolate_sinogram(
         ssrb_result,
@@ -916,7 +940,7 @@ def reconstruct_fanbeam_fbp_scalar_ref(
         q_filtered = filter_weighted_sinogram_2d(
             g_weighted,
             du_iso_mm=du_iso,
-            filter_name=filter_name,
+            filter_name=fname,
             cutoff_ratio=cutoff_ratio,
             lateral_pad_cols=lateral_pad_cols,
         )
@@ -963,9 +987,9 @@ def reconstruct_fanbeam_fbp_scalar_ref(
         x_mm=x_mm,
         fov_mm=active_fov,
         pixel_spacing_mm=d_xy,
-        center_xy_mm=(float(center_xy_mm[0]), float(center_xy_mm[1])),
+        center_xy_mm=(cx, cy),
         water_mu_mm_inv=float(water_mu_mm_inv),
-        filter_name=filter_name.strip().lower(),
+        filter_name=fname,
         cutoff_ratio=float(cutoff_ratio),
         inpaint_mode=prep.inpaint_mode,
         lateral_pad_cols=int(lateral_pad_cols),
@@ -1096,7 +1120,7 @@ def reconstruct_series_reference_streaming(
     image_size: int = 512,
     fov_mm: float | None = None,
     center_xy_mm: tuple[float, float] = (0.0, 0.0),
-    filter_name: str = "hann",
+    filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     inpaint_mode: str = "conjugate_feather",
     lateral_pad_cols: int = 96,

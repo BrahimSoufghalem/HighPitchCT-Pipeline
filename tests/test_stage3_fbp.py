@@ -136,6 +136,14 @@ class TestStage3ParkerAndFBP(unittest.TestCase):
             f_norm = np.fft.rfftfreq(n_fft, d=1.0) / 0.5
             self.assertTrue(np.all(h_win[f_norm > 0.850001] == 0.0))
 
+        # Verify default filter is ram_lak and aliases ramp / ram-lak / ram_lak are identical
+        h_default = build_fbp_filter_kernel_rfft(n_fft, du_iso)
+        h_ram_lak = build_fbp_filter_kernel_rfft(n_fft, du_iso, filter_name="ram_lak")
+        h_ram_dash = build_fbp_filter_kernel_rfft(n_fft, du_iso, filter_name="ram-lak")
+        np.testing.assert_array_equal(h_default, h_ram_lak)
+        np.testing.assert_array_equal(h_ramp, h_ram_lak)
+        np.testing.assert_array_equal(h_ram_dash, h_ram_lak)
+
     def test_vectorized_vs_scalar_fbp_parity_and_explicit_backend_policy(self) -> None:
         """Verify vectorized NumPy FBP matches scalar reference (<0.05 HU) and torch policy holds."""
         phantom = build_thorax_phantom(axial_scale=0.6)

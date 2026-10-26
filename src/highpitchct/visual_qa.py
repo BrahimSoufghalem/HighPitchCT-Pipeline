@@ -793,12 +793,15 @@ def save_stage3_real_fbp_visual_qa(
     if vendor_slice_hu is not None:
         vfov_half = 0.5 * float(vendor_fov_mm if vendor_fov_mm is not None else fov_mm)
         v_ext = [-vfov_half, vfov_half, -vfov_half, vfov_half]
+        ax3.set_facecolor("#000000")
         im3 = ax3.imshow(
             vendor_slice_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=v_ext, aspect="equal"
         )
+        ax3.set_xlim(-half_fov, half_fov)
+        ax3.set_ylim(-half_fov, half_fov)
         k_txt = f"kernel={vendor_kernel}, " if vendor_kernel else ""
-        ax3.set_title(f"3. Published Vendor CT ({k_txt}Visual Sanity Only)")
-        ax3.set_xlabel("x [mm] (Vendor FOV)")
+        ax3.set_title(f"3. Published Vendor CT ({k_txt}1:1 Matched FOV)")
+        ax3.set_xlabel(f"x [mm] (FOV={fov_mm:.0f} mm)")
         ax3.set_ylabel("y [mm]")
         fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
     else:
@@ -838,6 +841,286 @@ def save_stage3_real_fbp_visual_qa(
         f"6. Pure High-Pitch Artifact |x_RDC - x_ref| (MAE={rdc_vs_ref_metrics['mae_hu']:.1f} HU)"
     )
     ax6.set_xlabel("x [mm] (Target Signal for Stage 7 Dual-Domain DL)")
+    ax6.set_ylabel("y [mm]")
+    fig.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(target, format="png")
+    return target
+
+
+def save_stage4_phantom_forward_visual_qa(
+    out_path: str | Path,
+    *,
+    gt_hu: np.ndarray,
+    roundtrip_fbp_hu: np.ndarray,
+    roundtrip_metrics: dict[str, float],
+    s_hp_raw: np.ndarray,
+    mask_hp: np.ndarray,
+    s_reproj: np.ndarray,
+    rdc_prelim_hu: np.ndarray,
+    rdc_metrics: dict[str, float],
+    rdc_pitch: float,
+    itf_prelim_hu: np.ndarray,
+    itf_metrics: dict[str, float],
+    itf_pitch: float,
+    fov_mm: float,
+    z_slice_mm: float,
+    filter_name: str = "ram_lak",
+) -> Path:
+    """Save 6-panel (2x3) Stage 4 Phantom Forward->FBP Self-Consistency & RDC/ITF Visual QA PNG."""
+    target = Path(out_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    vmax_sino = float(np.percentile(s_reproj, 99.5)) if s_reproj.size else 5.0
+    vmax_sino = max(vmax_sino, 0.5)
+
+    if not _has_matplotlib():
+        return _compose_grid_png_stdlib(
+            target,
+            [
+                _panel_to_rgb(gt_hu, vmin=-1000.0, vmax=600.0),
+                _panel_to_rgb(roundtrip_fbp_hu, vmin=-1000.0, vmax=600.0),
+                _panel_to_rgb(
+                    s_hp_raw,
+                    vmin=0.0,
+                    vmax=vmax_sino,
+                    missing_mask=~np.asarray(mask_hp, dtype=bool),
+                ),
+                _panel_to_rgb(s_reproj, vmin=0.0, vmax=vmax_sino),
+                _panel_to_rgb(rdc_prelim_hu, vmin=-1000.0, vmax=600.0),
+                _panel_to_rgb(itf_prelim_hu, vmin=-1000.0, vmax=600.0),
+            ],
+            ncols=3,
+            tile_h=280,
+            tile_w=280,
+        )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    half_fov = 0.5 * float(fov_mm)
+    extent = [-half_fov, half_fov, -half_fov, half_fov]
+
+    fig = Figure(figsize=(17.5, 10.5), dpi=130)
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        f"Stage 4 Visual QA — 2D/3D Forward Projection Self-Consistency & RDC/ITF Simulation "
+        f"(z = {z_slice_mm:.1f} mm, filter = {filter_name})",
+        fontsize=12.5,
+        fontweight="bold",
+    )
+
+    ax1 = fig.add_subplot(2, 3, 1)
+    im1 = ax1.imshow(gt_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal")
+    ax1.set_title("A. Exact 3D Phantom Ground Truth [-1000, 600] HU", fontsize=9.5)
+    ax1.set_xlabel("x [mm] (Radiological: Left=Pat.Right, Right=Pat.Left)")
+    ax1.set_ylabel("y [mm] (+y = Anterior)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    ax2 = fig.add_subplot(2, 3, 2)
+    im2 = ax2.imshow(
+        roundtrip_fbp_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal"
+    )
+    ax2.set_title(
+        f"B. 2D Forward -> {filter_name} FBP (MAE={roundtrip_metrics['mae_hu']:.1f} HU, SSIM={roundtrip_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax2.set_xlabel("x [mm] (Zero Geometric Drift Proof)")
+    ax2.set_ylabel("y [mm]")
+    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    ax3 = fig.add_subplot(2, 3, 3)
+    meas_pct = 100.0 * float(np.mean(mask_hp))
+    ax3.imshow(
+        _overlay_missing_rgba(s_hp_raw, mask_hp, vmin=0.0, vmax=vmax_sino),
+        aspect="auto",
+    )
+    ax3.set_title(
+        f"C. Fig. 2(a) High-Pitch SSRB Sinogram (meas={meas_pct:.1f}%)",
+        fontsize=9.5,
+    )
+    ax3.set_xlabel("Virtual Flat Column u (Red = Missing Wedge)")
+    ax3.set_ylabel("Short-Scan Angle k")
+
+    ax4 = fig.add_subplot(2, 3, 4)
+    im4 = ax4.imshow(s_reproj, cmap="gray", vmin=0.0, vmax=vmax_sino, aspect="auto")
+    ax4.set_title(
+        "D. Fig. 2(d) Reprojected s_reproj = P_fan(mu_prelim)",
+        fontsize=9.5,
+    )
+    ax4.set_xlabel("Virtual Flat Column u (Input to Sinogram U-Net)")
+    ax4.set_ylabel("Short-Scan Angle k")
+    fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+
+    ax5 = fig.add_subplot(2, 3, 5)
+    im5 = ax5.imshow(
+        rdc_prelim_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal"
+    )
+    ax5.set_title(
+        f"E. RDC (p={rdc_pitch:.2f}) Prelim FBP (MAE={rdc_metrics['mae_hu']:.1f}, SSIM={rdc_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax5.set_xlabel("x [mm] (Fig. 1(b)/2(c) — Input to Image U-Net)")
+    ax5.set_ylabel("y [mm]")
+    fig.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
+
+    ax6 = fig.add_subplot(2, 3, 6)
+    im6 = ax6.imshow(
+        itf_prelim_hu, cmap="gray", vmin=-1000.0, vmax=600.0, extent=extent, aspect="equal"
+    )
+    ax6.set_title(
+        f"F. ITF (p={itf_pitch:.2f}) 3D Prelim FBP (MAE={itf_metrics['mae_hu']:.1f}, SSIM={itf_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax6.set_xlabel("x [mm] (Fig. 1(c)/2(c) — Full Cone-Beam + Missing Wedge)")
+    ax6.set_ylabel("y [mm]")
+    fig.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(target, format="png")
+    return target
+
+
+def save_stage4_real_simulation_visual_qa(
+    out_path: str | Path,
+    *,
+    case_id: str,
+    z_slice_mm: float,
+    native_pitch: float,
+    fov_mm: float,
+    fov_mask: np.ndarray,
+    filter_name: str,
+    x_target_hu: np.ndarray,
+    s_target: np.ndarray,
+    s_hp_raw: np.ndarray,
+    mask_hp: np.ndarray,
+    s_reproj: np.ndarray,
+    rdc_pitch: float,
+    rdc_prelim_hu: np.ndarray,
+    rdc_metrics: dict[str, float],
+    itf_pitch: float,
+    itf_prelim_hu: np.ndarray,
+    itf_metrics: dict[str, float],
+) -> Path:
+    """Save 6-panel (2x3) Stage 4 Real Patient (`C012`) Fig. 2(a)-(d) RDC & ITF Simulation PNG."""
+    target = Path(out_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fmask = np.asarray(fov_mask, dtype=bool)
+    err_rdc = np.where(fmask, np.abs(rdc_prelim_hu - x_target_hu), 0.0)
+    err_itf = np.where(fmask, np.abs(itf_prelim_hu - x_target_hu), 0.0)
+    vmax_sino = float(np.percentile(s_target, 99.5)) if s_target.size else 5.0
+    vmax_sino = max(vmax_sino, 0.5)
+
+    if not _has_matplotlib():
+        return _compose_grid_png_stdlib(
+            target,
+            [
+                _panel_to_rgb(x_target_hu, vmin=-1000.0, vmax=400.0),
+                _panel_to_rgb(
+                    s_hp_raw,
+                    vmin=0.0,
+                    vmax=vmax_sino,
+                    missing_mask=~np.asarray(mask_hp, dtype=bool),
+                ),
+                _panel_to_rgb(s_reproj, vmin=0.0, vmax=vmax_sino),
+                _panel_to_rgb(rdc_prelim_hu, vmin=-1000.0, vmax=400.0),
+                _panel_to_rgb(itf_prelim_hu, vmin=-1000.0, vmax=400.0),
+                _panel_to_rgb(err_itf, vmin=0.0, vmax=180.0, heat=True),
+            ],
+            ncols=3,
+            tile_h=280,
+            tile_w=280,
+        )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    half_fov = 0.5 * float(fov_mm)
+    extent = [-half_fov, half_fov, -half_fov, half_fov]
+
+    fig = Figure(figsize=(17.5, 10.5), dpi=130)
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        f"Stage 4 Real-Data Visual QA ({case_id}) — AAPM 2026 Fig. 2 Reprojection & RDC vs ITF "
+        f"at z = {z_slice_mm:.1f} mm ({filter_name}, FOV = {fov_mm:.0f} mm)",
+        fontsize=12.5,
+        fontweight="bold",
+    )
+
+    ax1 = fig.add_subplot(2, 3, 1)
+    im1 = ax1.imshow(
+        x_target_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=extent, aspect="equal"
+    )
+    ax1.set_title(
+        f"1. Ground-Truth Target x* (p={native_pitch:.2f}, {filter_name} FBP)",
+        fontsize=9.5,
+    )
+    ax1.set_xlabel("x [mm] (Radiological: Left=Pat.Right, Right=Pat.Left)")
+    ax1.set_ylabel("y [mm] (+y = Anterior)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    ax2 = fig.add_subplot(2, 3, 2)
+    meas_pct = 100.0 * float(np.mean(mask_hp))
+    ax2.imshow(
+        _overlay_missing_rgba(s_hp_raw, mask_hp, vmin=0.0, vmax=vmax_sino),
+        aspect="auto",
+    )
+    ax2.set_title(
+        f"2. Fig. 2(a) High-Pitch Sinogram (p={rdc_pitch:.2f}, meas={meas_pct:.1f}%)",
+        fontsize=9.5,
+    )
+    ax2.set_xlabel("Virtual Flat Column u (Red = Missing Wedge)")
+    ax2.set_ylabel("Short-Scan Angle k")
+
+    ax3 = fig.add_subplot(2, 3, 3)
+    im3 = ax3.imshow(s_reproj, cmap="gray", vmin=0.0, vmax=vmax_sino, aspect="auto")
+    ax3.set_title(
+        "3. Fig. 2(d) Reprojected s_reproj (Sinogram U-Net Input)",
+        fontsize=9.5,
+    )
+    ax3.set_xlabel("Virtual Flat Column u")
+    ax3.set_ylabel("Short-Scan Angle k")
+    fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+    ax4 = fig.add_subplot(2, 3, 4)
+    im4 = ax4.imshow(
+        rdc_prelim_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=extent, aspect="equal"
+    )
+    ax4.set_title(
+        f"4. RDC (p={rdc_pitch:.2f}) Prelim FBP (MAE={rdc_metrics['mae_hu']:.1f}, SSIM={rdc_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax4.set_xlabel("x [mm] (Fig. 1(b)/2(c) — Image U-Net Input RDC)")
+    ax4.set_ylabel("y [mm]")
+    fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+
+    ax5 = fig.add_subplot(2, 3, 5)
+    im5 = ax5.imshow(
+        itf_prelim_hu, cmap="gray", vmin=-1000.0, vmax=400.0, extent=extent, aspect="equal"
+    )
+    ax5.set_title(
+        f"5. ITF (p={itf_pitch:.2f}) 3D Prelim FBP (MAE={itf_metrics['mae_hu']:.1f}, SSIM={itf_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax5.set_xlabel("x [mm] (Fig. 1(c)/2(c) — Image U-Net Input ITF)")
+    ax5.set_ylabel("y [mm]")
+    fig.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
+
+    ax6 = fig.add_subplot(2, 3, 6)
+    # Side-by-side split error map: Left half = |x_RDC - x*|, Right half = |x_ITF - x*|
+    h_img, w_img = err_rdc.shape
+    split_err = np.empty_like(err_rdc)
+    split_err[:, : w_img // 2] = err_rdc[:, : w_img // 2]
+    split_err[:, w_img // 2 :] = err_itf[:, w_img // 2 :]
+    im6 = ax6.imshow(split_err, cmap="magma", vmin=0.0, vmax=180.0, extent=extent, aspect="equal")
+    ax6.axvline(0.0, color="#00ffff", linestyle="--", linewidth=1.2)
+    ax6.set_title(
+        f"6. |x_prelim - x*| (RDC MAE={rdc_metrics['mae_hu']:.1f} | ITF MAE={itf_metrics['mae_hu']:.1f} HU)",
+        fontsize=9.5,
+    )
+    ax6.set_xlabel("x [mm] (Left Half = RDC Error | Right Half = ITF Error)")
     ax6.set_ylabel("y [mm]")
     fig.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
 
