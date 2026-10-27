@@ -1128,3 +1128,173 @@ def save_stage4_real_simulation_visual_qa(
     fig.savefig(target, format="png")
     return target
 
+
+def save_stage5_dual_domain_visual_qa(
+    out_path: str | Path,
+    *,
+    title_prefix: str,
+    scenario: str,
+    target_pitch: float,
+    effective_pitch: float,
+    native_pitch: float,
+    z_slice_mm: float,
+    fov_mm: float,
+    fov_mask: np.ndarray,
+    filter_name: str,
+    s_hp_raw: np.ndarray,
+    mask_hp: np.ndarray,
+    s_dc: np.ndarray,
+    x_target_hu: np.ndarray,
+    x_prelim_hu: np.ndarray,
+    x_dc_hu: np.ndarray,
+    x_final_hu: np.ndarray,
+    prelim_metrics: dict[str, float],
+    domain1_dc_metrics: dict[str, float],
+    final_dual_metrics: dict[str, float],
+    sino_metrics: dict[str, float],
+    display_vmax_hu: float = 400.0,
+) -> Path:
+    """Save 6-panel (2x3) Stage 5 Dual-Domain DL Progression Visual QA PNG (Phantom or Real Patient)."""
+    target = Path(out_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fmask = np.asarray(fov_mask, dtype=bool)
+    err_pre = np.where(fmask, np.abs(x_prelim_hu - x_target_hu), 0.0)
+    err_fin = np.where(fmask, np.abs(x_final_hu - x_target_hu), 0.0)
+    h_img, w_img = err_pre.shape
+    split_err = np.empty_like(err_pre)
+    split_err[:, : w_img // 2] = err_pre[:, : w_img // 2]
+    split_err[:, w_img // 2 :] = err_fin[:, w_img // 2 :]
+
+    vmax_sino = float(np.percentile(s_dc, 99.5)) if s_dc.size else 5.0
+    vmax_sino = max(vmax_sino, 0.5)
+
+    if not _has_matplotlib():
+        return _compose_grid_png_stdlib(
+            target,
+            [
+                _panel_to_rgb(x_target_hu, vmin=-1000.0, vmax=display_vmax_hu),
+                _panel_to_rgb(s_dc, vmin=0.0, vmax=vmax_sino),
+                _panel_to_rgb(x_prelim_hu, vmin=-1000.0, vmax=display_vmax_hu),
+                _panel_to_rgb(x_dc_hu, vmin=-1000.0, vmax=display_vmax_hu),
+                _panel_to_rgb(x_final_hu, vmin=-1000.0, vmax=display_vmax_hu),
+                _panel_to_rgb(split_err, vmin=0.0, vmax=180.0, heat=True),
+            ],
+            ncols=3,
+            tile_h=280,
+            tile_w=280,
+        )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    half_fov = 0.5 * float(fov_mm)
+    extent = [-half_fov, half_fov, -half_fov, half_fov]
+    scen_up = scenario.strip().upper()
+
+    fig = Figure(figsize=(17.5, 10.5), dpi=130)
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        f"{title_prefix} — Physics-Conditioned Dual-Domain DL ({scen_up}, target p={target_pitch:.1f}, "
+        f"eff.p={effective_pitch:.2f}, z={z_slice_mm:.1f} mm, {filter_name}, FOV={fov_mm:.0f} mm)",
+        fontsize=12.0,
+        fontweight="bold",
+    )
+
+    ax1 = fig.add_subplot(2, 3, 1)
+    im1 = ax1.imshow(
+        x_target_hu,
+        cmap="gray",
+        vmin=-1000.0,
+        vmax=display_vmax_hu,
+        extent=extent,
+        aspect="equal",
+    )
+    ax1.set_title(
+        f"1. Ground-Truth Target x* (p={native_pitch:.2f}, {filter_name} FBP)",
+        fontsize=9.5,
+    )
+    ax1.set_xlabel("x [mm] (Radiological: Left=Pat.Right, Right=Pat.Left)")
+    ax1.set_ylabel("y [mm] (+y = Anterior)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    ax2 = fig.add_subplot(2, 3, 2)
+    im2 = ax2.imshow(s_dc, cmap="gray", vmin=0.0, vmax=vmax_sino, aspect="auto")
+    miss_pct = 100.0 * float(1.0 - np.mean(mask_hp))
+    w_mae_raw = sino_metrics.get("raw_missing_wedge_mae", 0.0)
+    w_mae_dc = sino_metrics.get("sinonet_dc_missing_wedge_mae", 0.0)
+    ax2.set_title(
+        f"2. SinoNet + Hard DC s_dc (Wedge={miss_pct:.1f}%, MAE {w_mae_raw:.2f}->{w_mae_dc:.2f})",
+        fontsize=9.5,
+    )
+    ax2.set_xlabel("Virtual Flat Column u (100% Measured Rays Preserved)")
+    ax2.set_ylabel("Short-Scan Angle k")
+    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    ax3 = fig.add_subplot(2, 3, 3)
+    im3 = ax3.imshow(
+        x_prelim_hu,
+        cmap="gray",
+        vmin=-1000.0,
+        vmax=display_vmax_hu,
+        extent=extent,
+        aspect="equal",
+    )
+    ax3.set_title(
+        f"3. Input x_prelim ({scen_up} p={effective_pitch:.2f}: RMSE={prelim_metrics['rmse_hu']:.1f}, SSIM={prelim_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax3.set_xlabel("x [mm] (Fig. 2(c) — Before Dual-Domain Network)")
+    ax3.set_ylabel("y [mm]")
+    fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+    ax4 = fig.add_subplot(2, 3, 4)
+    im4 = ax4.imshow(
+        x_dc_hu,
+        cmap="gray",
+        vmin=-1000.0,
+        vmax=display_vmax_hu,
+        extent=extent,
+        aspect="equal",
+    )
+    ax4.set_title(
+        f"4. Domain 1 Only: FBP(s_dc) (RMSE={domain1_dc_metrics['rmse_hu']:.1f} HU, SSIM={domain1_dc_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax4.set_xlabel("x [mm] (Differentiable Parker + Ram-Lak FBP Bridge)")
+    ax4.set_ylabel("y [mm]")
+    fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+
+    ax5 = fig.add_subplot(2, 3, 5)
+    im5 = ax5.imshow(
+        x_final_hu,
+        cmap="gray",
+        vmin=-1000.0,
+        vmax=display_vmax_hu,
+        extent=extent,
+        aspect="equal",
+    )
+    ax5.set_title(
+        f"5. Dual-Domain x_final (RMSE={final_dual_metrics['rmse_hu']:.1f} HU, SSIM={final_dual_metrics['ssim']:.3f})",
+        fontsize=9.5,
+    )
+    ax5.set_xlabel(f"x [mm] (PSNR={final_dual_metrics['psnr_db']:.1f} dB, MAE={final_dual_metrics['mae_hu']:.1f} HU)")
+    ax5.set_ylabel("y [mm]")
+    fig.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
+
+    ax6 = fig.add_subplot(2, 3, 6)
+    im6 = ax6.imshow(split_err, cmap="magma", vmin=0.0, vmax=180.0, extent=extent, aspect="equal")
+    ax6.axvline(0.0, color="#00ffff", linestyle="--", linewidth=1.2)
+    ax6.set_title(
+        f"6. Error |x - x*|: Left=x_prelim ({prelim_metrics['mae_hu']:.1f}) | Right=x_final ({final_dual_metrics['mae_hu']:.1f} HU)",
+        fontsize=9.5,
+    )
+    ax6.set_xlabel("x [mm] (Left Half = Before DL | Right Half = After Dual-Domain DL)")
+    ax6.set_ylabel("y [mm]")
+    fig.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    fig.savefig(target, format="png")
+    return target
+
+

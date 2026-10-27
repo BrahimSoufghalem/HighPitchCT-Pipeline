@@ -19,6 +19,16 @@ from .ctpd_reader import (
     scan_projection_series,
     verify_projection_orientation,
 )
+from .dual_domain_dl import (
+    DEFAULT_CLINICAL_HIGH_PITCHES,
+    DEFAULT_ITF_TRAINING_RATIO,
+    build_hybrid_phantom_dataset,
+    build_hybrid_series_dataset_streaming,
+    create_dual_domain_model,
+    save_dual_domain_checkpoint,
+    save_dual_domain_dataset_npz,
+    train_dual_domain_model,
+)
 from .forward_project import (
     build_dual_domain_pair_from_ssrb,
     compute_rdc_active_row_range,
@@ -66,6 +76,7 @@ from .visual_qa import (
     save_stage3_real_fbp_visual_qa,
     save_stage4_phantom_forward_visual_qa,
     save_stage4_real_simulation_visual_qa,
+    save_stage5_dual_domain_visual_qa,
 )
 
 
@@ -827,10 +838,101 @@ def _run_stage4_synthetic_phantom_check(
     }
 
 
+def _run_stage5_synthetic_phantom_check(
+    *,
+    figures_dir: Path | None = None,
+    filter_name: str = "ram_lak",
+    backend: str = "torch",
+    epochs: int = 8,
+    itf_ratio: float = DEFAULT_ITF_TRAINING_RATIO,
+) -> dict[str, Any]:
+    """Run Stage 5 synthetic verification: 60% ITF + 40% RDC across p in {1.5, 2.0, 2.5} + Dual-Domain DL."""
+    t0 = time.monotonic()
+    fname = normalize_filter_name(filter_name)
+    samples = build_hybrid_phantom_dataset(
+        pitches=DEFAULT_CLINICAL_HIGH_PITCHES,
+        scenarios=("itf", "rdc"),
+        z_slices_mm=(-12.0,),
+        native_pitch=0.85,
+        image_size=96,
+        fov_mm=360.0,
+        filter_name=fname,
+        backend=backend,
+    )
+    model, device = create_dual_domain_model(
+        sino_base_channels=16,
+        img_base_channels=16,
+        filter_name=fname,
+        backend=backend,
+        seed=42,
+    )
+    train_res = train_dual_domain_model(
+        model,
+        samples,
+        device=device,
+        epochs=max(2, int(epochs)),
+        lr=3.0e-3,
+        itf_ratio=itf_ratio,
+        seed=42,
+    )
+    preds = train_res["predictions"]
+    summary = train_res["summary"]
+
+    # Select primary display prediction: ITF at p=2.0 (or highest available ITF sample)
+    disp_pred = preds[0]
+    for p in preds:
+        if p.sample.scenario == "itf" and abs(p.sample.target_pitch - 2.0) < 0.1:
+            disp_pred = p
+            break
+
+    qa_png_str: str | None = None
+    if figures_dir is not None:
+        qa_png = save_stage5_dual_domain_visual_qa(
+            figures_dir / "stage5_phantom_dl_visual_qa.png",
+            title_prefix="Stage 5 Phantom Visual QA",
+            scenario=disp_pred.sample.scenario,
+            target_pitch=disp_pred.sample.target_pitch,
+            effective_pitch=disp_pred.sample.effective_pitch,
+            native_pitch=disp_pred.sample.native_pitch,
+            z_slice_mm=disp_pred.sample.z_slice_mm,
+            fov_mm=disp_pred.sample.fov_mm,
+            fov_mask=disp_pred.sample.fov_mask,
+            filter_name=fname,
+            s_hp_raw=disp_pred.sample.s_hp_raw,
+            mask_hp=disp_pred.sample.mask_hp,
+            s_dc=disp_pred.s_dc,
+            x_target_hu=disp_pred.sample.x_target_hu,
+            x_prelim_hu=disp_pred.sample.x_prelim_hu,
+            x_dc_hu=disp_pred.x_dc_hu,
+            x_final_hu=disp_pred.x_final_hu,
+            prelim_metrics=disp_pred.prelim_metrics,
+            domain1_dc_metrics=disp_pred.domain1_dc_metrics,
+            final_dual_metrics=disp_pred.final_dual_metrics,
+            sino_metrics=disp_pred.sinogram_progression_metrics,
+            display_vmax_hu=600.0,
+        )
+        qa_png_str = str(qa_png)
+
+    prog = summary["overall_progression"]
+    overall_pass = bool(
+        prog["stage3_final_dual_domain"]["rmse_hu"] <= prog["stage1_prelim_fbp"]["rmse_hu"]
+        and prog["stage1_prelim_fbp"]["rmse_hu"] < prog["stage0_raw_nofill"]["rmse_hu"]
+        and prog["sinogram_progression"]["measured_rays_max_abs_dev"] == 0.0
+    )
+    return {
+        "pass": overall_pass,
+        "elapsed_seconds": round(time.monotonic() - t0, 3),
+        "filter_name": fname,
+        "backend": backend,
+        "summary": summary,
+        "visual_qa_png": qa_png_str,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hpct",
-        description="HighPitchCT CLI (Stage 0 download/index, Stage 1 audit, Stage 2 SSRB, Stage 3 FBP)",
+        description="HighPitchCT CLI (Stage 0-5: Download, Audit, SSRB, Parker Ram-Lak FBP, Forward Sim, Dual-Domain DL)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1090,13 +1192,13 @@ def _parser() -> argparse.ArgumentParser:
     stage4.add_argument(
         "--target-pitch",
         type=float,
-        default=3.2,
-        help="Primary high-pitch factor to simulate for Visual QA and .npz export (default: 3.2)",
+        default=2.0,
+        help="Primary high-pitch factor to simulate for Visual QA and .npz export (default: 2.0)",
     )
     stage4.add_argument(
         "--pitches",
-        default="2.4,3.2,4.8",
-        help="Comma-separated list of RDC target pitches to benchmark in report (default: 2.4,3.2,4.8)",
+        default="1.5,2.0,2.5",
+        help="Comma-separated list of target high pitches to benchmark (default: 1.5,2.0,2.5)",
     )
     stage4.add_argument(
         "--num-slices",
@@ -1166,6 +1268,129 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage4.add_argument("--workers", type=int, default=8)
     stage4.add_argument("--no-progress", action="store_true")
+
+    stage5 = sub.add_parser(
+        "stage5-train",
+        aliases=["stage5-dl"],
+        help="Stage 5 Physics-Conditioned Dual-Domain DL (60% ITF + 40% RDC, p in {1.5, 2.0, 2.5}, Ram-Lak FBP Bridge) & Visual QA",
+    )
+    stage5.add_argument("--data-root", help="Writable root containing raw/tcia and manifests/")
+    stage5.add_argument(
+        "--case-id",
+        help="Optional patient case filter under raw/tcia (matches C012 or case_C012)",
+    )
+    stage5.add_argument("--series-dir", help="Explicit DICOM-CT-PD projection directory")
+    stage5.add_argument("--image-dir", help="Optional published CT image directory for FOV matching")
+    stage5.add_argument(
+        "--scenario",
+        choices=["rdc", "itf", "both"],
+        default="both",
+        help="High-pitch scenarios to include in dataset (default: both -> 60% ITF + 40% RDC)",
+    )
+    stage5.add_argument(
+        "--itf-ratio",
+        type=float,
+        default=DEFAULT_ITF_TRAINING_RATIO,
+        help="Training curriculum weight assigned to ITF vs RDC when both are enabled (default: 0.60)",
+    )
+    stage5.add_argument(
+        "--pitches",
+        default="1.5,2.0,2.5",
+        help="Comma-separated clinical high-pitch targets (default: 1.5,2.0,2.5)",
+    )
+    stage5.add_argument(
+        "--num-slices",
+        type=int,
+        default=1,
+        help="Number of interior axial z slices to extract per series (default: 1)",
+    )
+    stage5.add_argument(
+        "--image-size",
+        "--n-xy",
+        dest="image_size",
+        type=int,
+        default=256,
+        help="Reconstructed axial matrix size H = W (default: 256)",
+    )
+    stage5.add_argument(
+        "--fov-mm",
+        type=float,
+        default=None,
+        help="Reconstruction FOV diameter [mm] (default: matched to paired Vendor CT FOV or scanner FOV)",
+    )
+    stage5.add_argument(
+        "--filter",
+        "--filter-name",
+        dest="filter_name",
+        choices=["ram_lak", "ram-lak", "ramp", "shepp_logan", "cosine", "hamming", "hann"],
+        default="ram_lak",
+        help="FBP frequency filter (default: ram_lak)",
+    )
+    stage5.add_argument(
+        "--cutoff-ratio",
+        type=float,
+        default=1.0,
+        help="Normalized Nyquist frequency cutoff in (0, 1] (default: 1.0)",
+    )
+    stage5.add_argument(
+        "--inpaint-mode",
+        choices=["conjugate_feather", "angular_feather", "none"],
+        default="conjugate_feather",
+        help="Preliminary missing-wedge completion strategy (default: conjugate_feather)",
+    )
+    stage5.add_argument(
+        "--itf-slab-slices",
+        type=int,
+        default=7,
+        help="Number of axial reference slices in the 3D slab for ITF helical forward projection (default: 7)",
+    )
+    stage5.add_argument(
+        "--epochs",
+        type=int,
+        default=15,
+        help="Number of Dual-Domain optimization epochs (default: 15)",
+    )
+    stage5.add_argument(
+        "--lr",
+        type=float,
+        default=2.5e-3,
+        help="AdamW initial learning rate (default: 2.5e-3)",
+    )
+    stage5.add_argument(
+        "--sino-channels",
+        type=int,
+        default=24,
+        help="Base channel width for Domain-1 SinoInpaintUNet (default: 24)",
+    )
+    stage5.add_argument(
+        "--img-channels",
+        type=int,
+        default=24,
+        help="Base channel width for Domain-2 ImageRefineUNet (default: 24)",
+    )
+    stage5.add_argument(
+        "--backend",
+        choices=["torch", "torch_cuda"],
+        default="torch",
+        help="PyTorch execution backend (default: torch; torch_cuda requires GPU without silent fallback)",
+    )
+    stage5.add_argument(
+        "--save-model",
+        action="store_true",
+        help="Save trained DualDomainHighPitchNet weights to <data-root>/manifests/stage5_<case_id>_dual_domain.pt",
+    )
+    stage5.add_argument(
+        "--save-dataset-npz",
+        action="store_true",
+        help="Save multi-pitch ITF+RDC dataset to <data-root>/manifests/stage5_<case_id>_dataset.npz",
+    )
+    stage5.add_argument(
+        "--run-phantom-check",
+        action="store_true",
+        help="Run Stage 5 synthetic phantom verification alongside patient training",
+    )
+    stage5.add_argument("--workers", type=int, default=4)
+    stage5.add_argument("--no-progress", action="store_true")
 
     environment = sub.add_parser(
         "env", help="Report Kaggle/Full profile, disk quota, RAM, disk space, and GPUs"
@@ -2110,7 +2335,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 4 (v0.7.0)",
+            "stage": "Stage 4 (v0.8.0)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "simulated_series_count": len(simulated_series),
@@ -2118,6 +2343,231 @@ def main(argv: list[str] | None = None) -> int:
             "synthetic_phantom_forward_check": phantom_stage4,
         }
         out_json = env_prof.data_root / "manifests" / "stage4_sim_report.json"
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report["report_json"] = str(out_json)
+        print(json.dumps(report, indent=2))
+        return 0 if all_pass else 1
+
+    if args.command in {"stage5-train", "stage5-dl"}:
+        if args.workers < 1:
+            raise SystemExit("--workers must be at least 1")
+        if args.num_slices < 1:
+            raise SystemExit("--num-slices must be at least 1")
+        if args.image_size < 16:
+            raise SystemExit("--image-size must be at least 16")
+        if args.epochs < 1:
+            raise SystemExit("--epochs must be at least 1")
+        if not (0.0 <= float(args.itf_ratio) <= 1.0):
+            raise SystemExit("--itf-ratio must be in [0.0, 1.0]")
+
+        t_start = time.monotonic()
+        env_prof = resolve_environment_profile(data_root=args.data_root)
+        show_prog = not args.no_progress
+        figures_dir = env_prof.data_root / "manifests" / "figures"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        fname = normalize_filter_name(args.filter_name)
+
+        pitch_list = sorted(
+            {
+                float(x.strip())
+                for x in str(args.pitches).split(",")
+                if x.strip()
+            }
+        )
+        if not pitch_list or any(p <= 0.0 for p in pitch_list):
+            raise SystemExit("--pitches must contain positive floats, e.g. 1.5,2.0,2.5")
+
+        if args.scenario == "both":
+            scenarios_list = ("itf", "rdc")
+        else:
+            scenarios_list = (args.scenario,)
+
+        targets = _resolve_cli_series_targets(
+            env_prof.data_root / "raw" / "tcia",
+            case_id=args.case_id,
+            series_dir=args.series_dir,
+            image_dir=args.image_dir,
+            allow_empty_for_phantom=bool(args.run_phantom_check),
+        )
+
+        trained_series: list[dict[str, Any]] = []
+        all_pass = True
+
+        for cid, pdir, idir in targets:
+            geom, files = scan_projection_series(
+                pdir, workers=args.workers, show_progress=show_prog
+            )
+            traj = geom.trajectory_metrics()
+            native_pitch = float(traj["normalized_pitch"])
+            z_min_raw = float(np.min(geom.z0_mm))
+            z_max_raw = float(np.max(geom.z0_mm))
+            margin_mm = min(
+                1.5 * geom.coverage_isocenter_mm,
+                0.25 * max(0.0, z_max_raw - z_min_raw),
+            )
+            if args.num_slices == 1:
+                z_slices = np.array([0.5 * (z_min_raw + z_max_raw)], dtype=np.float64)
+            else:
+                z_slices = np.linspace(
+                    z_min_raw + margin_mm,
+                    z_max_raw - margin_mm,
+                    args.num_slices,
+                    dtype=np.float64,
+                )
+
+            vendor_fov_mm: float | None = None
+            if idir is not None and idir.exists():
+                vol_data = read_ct_image_volume(idir, water_mu_mm_inv=geom.water_mu_mm_inv)
+                ps_yx = vol_data["pixel_spacing_yx_mm"]
+                vendor_fov_mm = float(vol_data["shape_zyx"][2]) * float(ps_yx[1])
+
+            effective_fov_mm = (
+                args.fov_mm
+                if args.fov_mm is not None
+                else (vendor_fov_mm if vendor_fov_mm is not None and vendor_fov_mm > 0.0 else None)
+            )
+
+            samples = build_hybrid_series_dataset_streaming(
+                files,
+                z_slices,
+                case_id=cid,
+                geometry=geom,
+                pitches=pitch_list,
+                scenarios=scenarios_list,
+                image_size=args.image_size,
+                fov_mm=effective_fov_mm,
+                filter_name=fname,
+                cutoff_ratio=args.cutoff_ratio,
+                inpaint_mode=args.inpaint_mode,
+                itf_slab_slices=args.itf_slab_slices,
+                backend=args.backend,
+                workers=min(args.workers, 6),
+                show_progress=show_prog,
+            )
+
+            model, device = create_dual_domain_model(
+                sino_base_channels=args.sino_channels,
+                img_base_channels=args.img_channels,
+                filter_name=fname,
+                cutoff_ratio=args.cutoff_ratio,
+                backend=args.backend,
+                seed=42,
+            )
+            train_res = train_dual_domain_model(
+                model,
+                samples,
+                device=device,
+                epochs=args.epochs,
+                lr=args.lr,
+                itf_ratio=float(args.itf_ratio),
+                seed=42,
+            )
+            preds = train_res["predictions"]
+            summary = train_res["summary"]
+
+            # Choose primary display sample: prefer ITF at middle pitch (e.g. 2.0)
+            disp_pred = preds[len(preds) // 2]
+            mid_pitch = pitch_list[len(pitch_list) // 2]
+            for p in preds:
+                if p.sample.scenario == "itf" and abs(p.sample.target_pitch - mid_pitch) < 0.15:
+                    disp_pred = p
+                    break
+
+            qa_png = save_stage5_dual_domain_visual_qa(
+                figures_dir / f"stage5_{cid}_dl_visual_qa.png",
+                title_prefix=f"Stage 5 Real-Data Visual QA ({cid})",
+                scenario=disp_pred.sample.scenario,
+                target_pitch=disp_pred.sample.target_pitch,
+                effective_pitch=disp_pred.sample.effective_pitch,
+                native_pitch=disp_pred.sample.native_pitch,
+                z_slice_mm=disp_pred.sample.z_slice_mm,
+                fov_mm=disp_pred.sample.fov_mm,
+                fov_mask=disp_pred.sample.fov_mask,
+                filter_name=fname,
+                s_hp_raw=disp_pred.sample.s_hp_raw,
+                mask_hp=disp_pred.sample.mask_hp,
+                s_dc=disp_pred.s_dc,
+                x_target_hu=disp_pred.sample.x_target_hu,
+                x_prelim_hu=disp_pred.sample.x_prelim_hu,
+                x_dc_hu=disp_pred.x_dc_hu,
+                x_final_hu=disp_pred.x_final_hu,
+                prelim_metrics=disp_pred.prelim_metrics,
+                domain1_dc_metrics=disp_pred.domain1_dc_metrics,
+                final_dual_metrics=disp_pred.final_dual_metrics,
+                sino_metrics=disp_pred.sinogram_progression_metrics,
+                display_vmax_hu=400.0,
+            )
+
+            prog = summary["overall_progression"]
+            series_pass = bool(
+                prog["stage3_final_dual_domain"]["rmse_hu"]
+                <= prog["stage1_prelim_fbp"]["rmse_hu"]
+                and prog["stage1_prelim_fbp"]["rmse_hu"]
+                <= prog["stage0_raw_nofill"]["rmse_hu"]
+                and prog["sinogram_progression"]["measured_rays_max_abs_dev"] == 0.0
+            )
+            if not series_pass:
+                all_pass = False
+
+            entry: dict[str, Any] = {
+                "case_id": cid,
+                "series_dir": str(pdir),
+                "native_normalized_pitch": round(native_pitch, 5),
+                "fov_mm": round(float(disp_pred.sample.fov_mm), 4),
+                "filter_name": fname,
+                "backend": args.backend,
+                "epochs": int(args.epochs),
+                "itf_ratio": round(float(args.itf_ratio), 4),
+                "pitches": pitch_list,
+                "series_pass": series_pass,
+                "summary": summary,
+                "visual_qa_png": str(qa_png),
+            }
+
+            if getattr(args, "save_model", False):
+                ckpt_path = save_dual_domain_checkpoint(
+                    env_prof.data_root / "manifests" / f"stage5_{cid}_dual_domain.pt",
+                    model,
+                    summary=summary,
+                    sino_base_channels=args.sino_channels,
+                    img_base_channels=args.img_channels,
+                    filter_name=fname,
+                    cutoff_ratio=args.cutoff_ratio,
+                )
+                entry["model_checkpoint_pt"] = str(ckpt_path)
+
+            if getattr(args, "save_dataset_npz", False):
+                ds_path = save_dual_domain_dataset_npz(
+                    env_prof.data_root / "manifests" / f"stage5_{cid}_dataset.npz",
+                    samples,
+                    itf_ratio=float(args.itf_ratio),
+                )
+                entry["dataset_npz"] = str(ds_path)
+
+            trained_series.append(entry)
+
+        phantom_stage5 = None
+        if args.run_phantom_check:
+            phantom_stage5 = _run_stage5_synthetic_phantom_check(
+                figures_dir=figures_dir,
+                filter_name=fname,
+                backend=args.backend,
+                epochs=min(max(4, args.epochs), 10),
+                itf_ratio=float(args.itf_ratio),
+            )
+            if not phantom_stage5["pass"]:
+                all_pass = False
+
+        report = {
+            "stage": "Stage 5 (v0.8.0)",
+            "overall_pass": all_pass,
+            "elapsed_seconds": round(time.monotonic() - t_start, 3),
+            "trained_series_count": len(trained_series),
+            "trained_series": trained_series,
+            "synthetic_phantom_dl_check": phantom_stage5,
+        }
+        out_json = env_prof.data_root / "manifests" / "stage5_dl_report.json"
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
         report["report_json"] = str(out_json)

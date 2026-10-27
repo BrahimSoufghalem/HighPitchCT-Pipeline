@@ -561,18 +561,19 @@ def synthesize_itf_helical_geometry(
     n_views = int(math.ceil(max(n_views_span, n_views_min) / 8.0) * 8)
 
     idx = np.arange(n_views, dtype=np.float64)
-    mid_i = 0.5 * float(n_views - 1)
-    phi0_start = float(base_geometry.phi0_unwrapped_rad[0])
-    phi0_unwrap = phi0_start + idx * dphi_step
+    i_ref = int(np.argmin(np.abs(base_geometry.z0_mm - z_mid)))
+    phi0_mid = float(base_geometry.phi0_unwrapped_rad[i_ref])
+    mid_i = float(n_views // 2)
+    phi0_unwrap = phi0_mid + (idx - mid_i) * dphi_step
     phi0_wrapped = ((phi0_unwrap + math.pi) % (2.0 * math.pi)) - math.pi
     z0_arr = z_mid + (idx - mid_i) * dz_step
 
-    # Tile the exact periodic FFS shift pattern from base_geometry
+    # Preserve the periodic FFS shift pattern from base_geometry
     base_len = int(base_geometry.n_views)
-    tile_reps = (n_views + base_len - 1) // base_len
-    dphi_arr = np.tile(base_geometry.dphi_rad, tile_reps)[:n_views].copy()
-    dz_arr = np.tile(base_geometry.dz_mm, tile_reps)[:n_views].copy()
-    drho_arr = np.tile(base_geometry.drho_mm, tile_reps)[:n_views].copy()
+    ffs_idx = np.arange(n_views, dtype=np.int64) % base_len
+    dphi_arr = base_geometry.dphi_rad[ffs_idx].copy()
+    dz_arr = base_geometry.dz_mm[ffs_idx].copy()
+    drho_arr = base_geometry.drho_mm[ffs_idx].copy()
 
     return HelicalGeometry(
         series_instance_uid=f"{base_geometry.series_instance_uid}.ITF_p{target_pitch:.2f}",
@@ -806,23 +807,61 @@ def _blend_data_consistent_reprojected_sinogram(
     mask_hp: np.ndarray,
     s_reproj: np.ndarray,
     *,
+    s_hp_extrap: np.ndarray | None = None,
     feather_passes: int = 4,
 ) -> np.ndarray:
-    """Combine measured rays `s_hp_raw[mask_hp]` with reprojected preliminary rays `s_reproj[~mask_hp]`."""
+    """Combine measured rays `s_hp_raw[mask_hp]` with boundary-anchored reprojected rays `s_reproj[~mask_hp]`."""
     raw = np.asarray(s_hp_raw, dtype=np.float32)
     mask = np.asarray(mask_hp, dtype=bool)
     rep = np.asarray(s_reproj, dtype=np.float32)
+    ext = np.asarray(s_hp_extrap, dtype=np.float32) if s_hp_extrap is not None else None
 
     out = np.where(mask, raw, rep).astype(np.float64)
     unmeasured = ~mask
     if not np.any(unmeasured):
         return out.astype(np.float32)
 
-    for s_idx in range(out.shape[0]):
+    n_slices, n_beta, n_u = out.shape
+    for s_idx in range(n_slices):
         um = unmeasured[s_idx]
         if not np.any(um):
             continue
-        cur = out[s_idx]
+        cur_mask = mask[s_idx].copy()
+        cur = out[s_idx].copy()
+        rep_s = rep[s_idx].astype(np.float64)
+
+        # Step 0: Pre-fill any completely unmeasured lateral border column (e.g. quarter-offset edge)
+        # from its nearest measured column at angles where that neighbor is measured.
+        col_has_meas = np.any(cur_mask, axis=0)
+        if not np.all(col_has_meas) and np.any(col_has_meas):
+            meas_cols = np.where(col_has_meas)[0]
+            for m_un in np.where(~col_has_meas)[0]:
+                nearest_m = int(meas_cols[np.argmin(np.abs(meas_cols - m_un))])
+                nb_mask = cur_mask[:, nearest_m]
+                cur[nb_mask, m_un] = cur[nb_mask, nearest_m]
+                cur_mask[nb_mask, m_un] = True
+
+        # Step 1: Anchor reprojected wedge to measured boundary values along angle beta:
+        # s_corr(beta, u) = s_reproj(beta, u) + interp_beta[s_raw - s_reproj](beta, u)
+        for m_idx in range(n_u):
+            col_m = cur_mask[:, m_idx]
+            if np.all(col_m) or not np.any(col_m):
+                continue
+            valid_k = np.where(col_m)[0]
+            miss_k = np.where(~col_m)[0]
+            diff_valid = cur[valid_k, m_idx] - rep_s[valid_k, m_idx]
+            diff_interp = np.interp(
+                miss_k.astype(np.float64),
+                valid_k.astype(np.float64),
+                diff_valid,
+            )
+            reproj_anchored = np.maximum(0.0, rep_s[miss_k, m_idx] + diff_interp)
+            if ext is not None:
+                ext_vals = ext[s_idx, miss_k, m_idx].astype(np.float64)
+                cur[miss_k, m_idx] = 0.5 * reproj_anchored + 0.5 * ext_vals
+            else:
+                cur[miss_k, m_idx] = reproj_anchored
+
         for _ in range(max(0, int(feather_passes))):
             pad_u = np.pad(cur, ((0, 0), (1, 1)), mode="edge")
             sm_u = 0.25 * pad_u[:, :-2] + 0.50 * pad_u[:, 1:-1] + 0.25 * pad_u[:, 2:]
@@ -831,7 +870,7 @@ def _blend_data_consistent_reprojected_sinogram(
             pad_k = np.pad(cur, ((1, 1), (0, 0)), mode="edge")
             sm_k = 0.25 * pad_k[:-2, :] + 0.50 * pad_k[1:-1, :] + 0.25 * pad_k[2:, :]
             cur = np.where(um, sm_k, cur)
-        out[s_idx] = np.where(mask[s_idx], raw[s_idx], cur)
+        out[s_idx] = np.where(mask[s_idx], raw[s_idx], np.maximum(0.0, cur))
 
     return out.astype(np.float32)
 
@@ -972,24 +1011,41 @@ def build_dual_domain_pair_from_ssrb(
     # 4. High-Pitch Fig. 2(d): 2D Fan-Beam Reprojection of non-negative mu_prelim
     # Clip negative streak undershoots below air (mu < 0) before forward projection!
     mu_prelim_nonneg = np.maximum(fbp_prelim.mu_slices, np.float32(0.0))
+    same_grid = (
+        s_hp_raw.shape == s_target.shape
+        and np.allclose(ssrb_hp.beta_rad, ssrb_ref.beta_rad, atol=1e-4)
+        and np.allclose(ssrb_hp.u_coords_mm, ssrb_ref.u_coords_mm, atol=1e-4)
+    )
+    active_beta_rad = ssrb_ref.beta_rad if same_grid else ssrb_hp.beta_rad
+    active_u_coords = ssrb_ref.u_coords_mm if same_grid else ssrb_hp.u_coords_mm
+    if not same_grid:
+        mu_target_nonneg = np.maximum(fbp_ref.mu_slices, np.float32(0.0))
+        s_target = forward_project_fanbeam_2d(
+            mu_target_nonneg,
+            active_beta_rad,
+            active_u_coords,
+            rho0_mm=ssrb_hp.rho0_mm,
+            d0_mm=ssrb_hp.d0_mm,
+            fov_mm=fbp_ref.fov_mm,
+            center_xy_mm=fbp_ref.center_xy_mm,
+            backend=backend,
+            show_progress=False,
+        )
     s_reproj = forward_project_fanbeam_2d(
         mu_prelim_nonneg,
-        ssrb_ref.beta_rad,
-        ssrb_ref.u_coords_mm,
-        rho0_mm=ssrb_ref.rho0_mm,
-        d0_mm=ssrb_ref.d0_mm,
+        active_beta_rad,
+        active_u_coords,
+        rho0_mm=ssrb_hp.rho0_mm,
+        d0_mm=ssrb_hp.d0_mm,
         fov_mm=fbp_ref.fov_mm,
         center_xy_mm=fbp_ref.center_xy_mm,
         backend=backend,
         show_progress=show_progress,
     )
-    # If ssrb_hp and ssrb_ref share the same angular grid, blend measured rays for s_reproj_dc
-    if s_hp_raw.shape == s_reproj.shape and np.allclose(ssrb_hp.beta_rad, ssrb_ref.beta_rad, atol=1e-4):
-        s_reproj_dc = _blend_data_consistent_reprojected_sinogram(s_hp_raw, mask_hp, s_reproj)
-        eval_mask = mask_hp
-    else:
-        s_reproj_dc = s_reproj.copy()
-        eval_mask = None
+    s_reproj_dc = _blend_data_consistent_reprojected_sinogram(
+        s_hp_raw, mask_hp, s_reproj, s_hp_extrap=s_hp_extrap
+    )
+    eval_mask = mask_hp
 
     prelim_metrics = compute_reconstruction_metrics(
         fbp_prelim.hu_slices, fbp_ref.hu_slices, fov_mask=fbp_ref.fov_mask
@@ -1032,8 +1088,8 @@ def build_dual_domain_pair_from_ssrb(
         s_hp_parker_weighted=s_hp_parker,
         s_reproj=s_reproj,
         s_reproj_dc=s_reproj_dc,
-        beta_rad=ssrb_ref.beta_rad.copy(),
-        u_coords_mm=ssrb_ref.u_coords_mm.copy(),
+        beta_rad=active_beta_rad.copy(),
+        u_coords_mm=active_u_coords.copy(),
         mu_target=fbp_ref.mu_slices.copy(),
         x_target_hu=fbp_ref.hu_slices.copy(),
         mu_prelim=fbp_prelim.mu_slices.copy(),
@@ -1052,11 +1108,11 @@ def simulate_series_high_pitch_streaming(
     *,
     geometry: HelicalGeometry | None = None,
     scenario: str = "rdc",
-    target_pitch: float = 3.2,
+    target_pitch: float = 2.0,
     image_size: int = 512,
     fov_mm: float | None = None,
     center_xy_mm: tuple[float, float] = (0.0, 0.0),
-     filter_name: str = "ram_lak",
+    filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     inpaint_mode: str = "conjugate_feather",
     backend: str = "numpy",
