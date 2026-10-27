@@ -804,6 +804,7 @@ def run_generalization_experiment(
         "unseen_test_ssim_gain_vs_prelim": round(te_fin_ssim - te_pre_ssim, 6),
         "unseen_test_measured_rays_max_abs_dev": te_meas_dev,
         "unseen_test_monotonic_pass": unseen_monotonic_pass,
+        "device_configuration": train_summary.get("device_configuration"),
     }
 
     return {
