@@ -1491,10 +1491,28 @@ def train_dual_domain_model(
         if best_joint_state is not None:
             model.load_state_dict(best_joint_state)
 
-    # Calibrate Domain-2 residual scale so Final Dual-Domain strictly improves or equals Domain-1
+    # Safeguard Domain-1 residual scale on training samples if needed
+    base_sino_scale = float(model.sino_net.res_scale.detach().item())
+    best_preds = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
+    mean_pre = float(np.mean([p.prelim_metrics["rmse_hu"] for p in best_preds]))
+    best_mean_d1 = float(np.mean([p.domain1_dc_metrics["rmse_hu"] for p in best_preds]))
+    if best_mean_d1 > mean_pre:
+        best_sino_alpha = 1.0
+        for s_alpha in (0.5, 0.25, 0.1, 0.0):
+            with torch.no_grad():
+                model.sino_net.res_scale.fill_(base_sino_scale * s_alpha)
+            cand_preds = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
+            cand_d1 = float(np.mean([p.domain1_dc_metrics["rmse_hu"] for p in cand_preds]))
+            if cand_d1 < best_mean_d1 - 1e-5:
+                best_mean_d1 = cand_d1
+                best_sino_alpha = s_alpha
+                best_preds = cand_preds
+        with torch.no_grad():
+            model.sino_net.res_scale.fill_(base_sino_scale * best_sino_alpha)
+
+    # Calibrate Domain-2 residual scale on training samples so Final Dual-Domain strictly improves or equals Domain-1
     base_img_scale = float(model.img_net.res_scale.detach().item())
     best_alpha = 1.0
-    best_preds = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
     best_mean_fin = float(np.mean([p.final_dual_metrics["rmse_hu"] for p in best_preds]))
     for alpha in (0.75, 0.5, 0.25, 0.0):
         with torch.no_grad():
@@ -1854,6 +1872,7 @@ def build_hybrid_series_dataset_streaming(
     cutoff_ratio: float = 1.0,
     inpaint_mode: str = "conjugate_feather",
     itf_slab_slices: int = 7,
+    itf_slab_half_span_mm: float | None = None,
     backend: str = "numpy",
     workers: int = 4,
     show_progress: bool = False,
@@ -1910,9 +1929,14 @@ def build_hybrid_series_dataset_streaming(
     if "itf" in scen_norm:
         z_min_raw = float(np.min(geometry.z0_mm))
         z_max_raw = float(np.max(geometry.z0_mm))
-        half_cov = 0.85 * float(geometry.coverage_isocenter_mm)
-        slab_z_lo = max(z_min_raw + 0.5 * half_cov, float(np.min(z_req)) - half_cov)
-        slab_z_hi = min(z_max_raw - 0.5 * half_cov, float(np.max(z_req)) + half_cov)
+        half_cov = (
+            float(itf_slab_half_span_mm)
+            if itf_slab_half_span_mm is not None
+            else 0.85 * float(geometry.coverage_isocenter_mm)
+        )
+        margin_raw = 0.5 * 0.85 * float(geometry.coverage_isocenter_mm)
+        slab_z_lo = max(z_min_raw + margin_raw, float(np.min(z_req)) - half_cov)
+        slab_z_hi = min(z_max_raw - margin_raw, float(np.max(z_req)) + half_cov)
         if slab_z_hi <= slab_z_lo:
             slab_z_lo = float(np.min(z_req)) - 10.0
             slab_z_hi = float(np.max(z_req)) + 10.0

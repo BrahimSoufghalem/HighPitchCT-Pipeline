@@ -38,6 +38,11 @@ from .forward_project import (
     simulate_series_high_pitch_streaming,
     synthesize_itf_helical_geometry,
 )
+from .generalization import (
+    build_multi_phantom_generalization_split,
+    build_real_series_generalization_split,
+    run_generalization_experiment,
+)
 from .index_dicom import index_dicom_tree
 from .manifest import read_series_manifest, write_series_manifest
 from .phantom import (
@@ -77,6 +82,7 @@ from .visual_qa import (
     save_stage4_phantom_forward_visual_qa,
     save_stage4_real_simulation_visual_qa,
     save_stage5_dual_domain_visual_qa,
+    save_stage6_generalization_visual_qa,
 )
 
 
@@ -929,10 +935,99 @@ def _run_stage5_synthetic_phantom_check(
     }
 
 
+def _run_stage6_synthetic_generalization_check(
+    *,
+    figures_dir: Path | None = None,
+    filter_name: str = "ram_lak",
+    backend: str = "torch",
+    epochs: int = 8,
+    itf_ratio: float = DEFAULT_ITF_TRAINING_RATIO,
+) -> dict[str, Any]:
+    """Run Stage 6 synthetic multi-phantom zero-leakage generalization check."""
+    t0 = time.monotonic()
+    fname = normalize_filter_name(filter_name)
+    split = build_multi_phantom_generalization_split(
+        pitches=DEFAULT_CLINICAL_HIGH_PITCHES,
+        scenarios=("itf", "rdc"),
+        image_size=96,
+        fov_mm=360.0,
+        filter_name=fname,
+        backend=backend,
+    )
+    res = run_generalization_experiment(
+        split["train_samples"],
+        split["test_samples"],
+        split_mode="patient_split",
+        sino_base_channels=16,
+        img_base_channels=16,
+        filter_name=fname,
+        epochs=max(3, int(epochs)),
+        lr=3.0e-3,
+        itf_ratio=itf_ratio,
+        backend=backend,
+        seed=42,
+    )
+    test_preds = res["unseen_test_predictions"]
+    disp_pred = test_preds[0]
+    for p in test_preds:
+        if p.sample.scenario == "itf" and abs(p.sample.target_pitch - 2.0) < 0.1:
+            disp_pred = p
+            break
+
+    qa_png_str: str | None = None
+    if figures_dir is not None:
+        qa_png = save_stage6_generalization_visual_qa(
+            figures_dir / "stage6_phantom_generalization_visual_qa.png",
+            title_prefix="Stage 6 Multi-Phantom Visual QA",
+            split_mode="patient_split",
+            train_cases_str="PHANTOM_TRAIN_A,PHANTOM_TRAIN_B",
+            test_case_id=disp_pred.sample.case_id,
+            scenario=disp_pred.sample.scenario,
+            target_pitch=disp_pred.sample.target_pitch,
+            effective_pitch=disp_pred.sample.effective_pitch,
+            native_pitch=disp_pred.sample.native_pitch,
+            z_slice_mm=disp_pred.sample.z_slice_mm,
+            fov_mm=disp_pred.sample.fov_mm,
+            fov_mask=disp_pred.sample.fov_mask,
+            filter_name=fname,
+            s_hp_raw=disp_pred.sample.s_hp_raw,
+            mask_hp=disp_pred.sample.mask_hp,
+            s_dc=disp_pred.s_dc,
+            x_target_hu=disp_pred.sample.x_target_hu,
+            x_prelim_hu=disp_pred.sample.x_prelim_hu,
+            x_dc_hu=disp_pred.x_dc_hu,
+            x_final_hu=disp_pred.x_final_hu,
+            prelim_metrics=disp_pred.prelim_metrics,
+            domain1_dc_metrics=disp_pred.domain1_dc_metrics,
+            final_dual_metrics=disp_pred.final_dual_metrics,
+            sino_metrics=disp_pred.sinogram_progression_metrics,
+            display_vmax_hu=600.0,
+        )
+        qa_png_str = str(qa_png)
+
+    gen_m = res["generalization_metrics"]
+    overall_pass = bool(
+        gen_m["zero_leakage_verified"]
+        and gen_m["unseen_test_monotonic_pass"]
+        and gen_m["unseen_test_measured_rays_max_abs_dev"] == 0.0
+    )
+    return {
+        "pass": overall_pass,
+        "elapsed_seconds": round(time.monotonic() - t0, 3),
+        "filter_name": fname,
+        "backend": backend,
+        "zero_leakage_audit": res["zero_leakage_audit"],
+        "generalization_metrics": gen_m,
+        "train_summary": res["train_summary"],
+        "unseen_test_summary": res["unseen_test_summary"],
+        "visual_qa_png": qa_png_str,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hpct",
-        description="HighPitchCT CLI (Stage 0-5: Download, Audit, SSRB, Parker Ram-Lak FBP, Forward Sim, Dual-Domain DL)",
+        description="HighPitchCT CLI (Stage 0-6: Download, Audit, SSRB, Parker Ram-Lak FBP, Forward Sim, Dual-Domain DL, Generalization)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1274,7 +1369,12 @@ def _parser() -> argparse.ArgumentParser:
         aliases=["stage5-dl"],
         help="Stage 5 Physics-Conditioned Dual-Domain DL (60% ITF + 40% RDC, p in {1.5, 2.0, 2.5}, Ram-Lak FBP Bridge) & Visual QA",
     )
-    stage5.add_argument("--data-root", help="Writable root containing raw/tcia and manifests/")
+    stage5.add_argument(
+        "--data-root",
+        "--workspace",
+        dest="data_root",
+        help="Writable root containing raw/tcia and manifests/",
+    )
     stage5.add_argument(
         "--case-id",
         help="Optional patient case filter under raw/tcia (matches C012 or case_C012)",
@@ -1289,6 +1389,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage5.add_argument(
         "--itf-ratio",
+        "--itf-weight",
+        dest="itf_ratio",
         type=float,
         default=DEFAULT_ITF_TRAINING_RATIO,
         help="Training curriculum weight assigned to ITF vs RDC when both are enabled (default: 0.60)",
@@ -1391,6 +1493,157 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage5.add_argument("--workers", type=int, default=4)
     stage5.add_argument("--no-progress", action="store_true")
+
+    stage6 = sub.add_parser(
+        "stage6-generalize",
+        aliases=["stage6-eval"],
+        help="Stage 6 Zero-Leakage Multi-Patient / Multi-Zone Generalization & Out-of-Sample Evaluation",
+    )
+    stage6.add_argument(
+        "--data-root",
+        "--workspace",
+        dest="data_root",
+        help="Writable root containing raw/tcia and manifests/",
+    )
+    stage6.add_argument(
+        "--case-id",
+        help="Optional patient case filter under raw/tcia (e.g. C012)",
+    )
+    stage6.add_argument("--series-dir", help="Explicit DICOM-CT-PD projection directory")
+    stage6.add_argument("--image-dir", help="Optional published CT image directory for FOV matching")
+    stage6.add_argument(
+        "--split-mode",
+        choices=["auto", "patient_split", "axial_guardband"],
+        default="auto",
+        help="Zero-leakage split protocol: 'patient_split' (>=2 patients), 'axial_guardband' (disjoint thorax slabs), or 'auto'",
+    )
+    stage6.add_argument(
+        "--train-cases",
+        help="Comma-separated training patient case IDs for patient_split (e.g. C012)",
+    )
+    stage6.add_argument(
+        "--test-cases",
+        help="Comma-separated unseen test patient case IDs for patient_split (e.g. C027)",
+    )
+    stage6.add_argument(
+        "--train-slices-per-case",
+        type=int,
+        default=2,
+        help="Number of training axial slices extracted per training case (default: 2)",
+    )
+    stage6.add_argument(
+        "--test-slices-per-case",
+        type=int,
+        default=1,
+        help="Number of held-out unseen test axial slices extracted per test case (default: 1)",
+    )
+    stage6.add_argument(
+        "--min-guardband-mm",
+        type=float,
+        default=45.0,
+        help="Minimum helical cone-beam dead-zone guard band [mm] between train and test zones in axial_guardband mode (default: 45.0)",
+    )
+    stage6.add_argument(
+        "--scenario",
+        choices=["rdc", "itf", "both"],
+        default="both",
+        help="High-pitch scenarios to include (default: both -> 60% ITF + 40% RDC)",
+    )
+    stage6.add_argument(
+        "--itf-ratio",
+        "--itf-weight",
+        dest="itf_ratio",
+        type=float,
+        default=DEFAULT_ITF_TRAINING_RATIO,
+        help="Training curriculum weight assigned to ITF vs RDC (default: 0.60)",
+    )
+    stage6.add_argument(
+        "--pitches",
+        default="1.5,2.0,2.5",
+        help="Comma-separated clinical high-pitch targets (default: 1.5,2.0,2.5)",
+    )
+    stage6.add_argument(
+        "--image-size",
+        "--n-xy",
+        dest="image_size",
+        type=int,
+        default=256,
+        help="Reconstructed axial matrix size H = W (default: 256)",
+    )
+    stage6.add_argument(
+        "--fov-mm",
+        type=float,
+        default=None,
+        help="Reconstruction FOV diameter [mm] (default: matched to paired Vendor CT FOV or scanner FOV)",
+    )
+    stage6.add_argument(
+        "--filter",
+        "--filter-name",
+        dest="filter_name",
+        choices=["ram_lak", "ram-lak", "ramp", "shepp_logan", "cosine", "hamming", "hann"],
+        default="ram_lak",
+        help="FBP frequency filter (default: ram_lak)",
+    )
+    stage6.add_argument(
+        "--cutoff-ratio",
+        type=float,
+        default=1.0,
+        help="Normalized Nyquist frequency cutoff in (0, 1] (default: 1.0)",
+    )
+    stage6.add_argument(
+        "--inpaint-mode",
+        choices=["conjugate_feather", "angular_feather", "none"],
+        default="conjugate_feather",
+        help="Preliminary missing-wedge completion strategy (default: conjugate_feather)",
+    )
+    stage6.add_argument(
+        "--itf-slab-slices",
+        type=int,
+        default=7,
+        help="Number of axial reference slices in each 3D ITF slab (default: 7)",
+    )
+    stage6.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Total 3-Stage Dual-Domain training epochs on train_samples (default: 30)",
+    )
+    stage6.add_argument(
+        "--lr",
+        type=float,
+        default=1.5e-3,
+        help="AdamW initial learning rate (default: 1.5e-3)",
+    )
+    stage6.add_argument(
+        "--sino-channels",
+        type=int,
+        default=64,
+        help="Base channel width for 4-level Domain-1 SinoInpaintUNet: 64->128->256->512 (default: 64)",
+    )
+    stage6.add_argument(
+        "--img-channels",
+        type=int,
+        default=64,
+        help="Base channel width for 4-level Domain-2 ImageRefineUNet: 64->128->256->512 (default: 64)",
+    )
+    stage6.add_argument(
+        "--backend",
+        choices=["torch", "torch_cuda"],
+        default="torch",
+        help="PyTorch execution backend (default: torch; torch_cuda requires GPU without silent fallback)",
+    )
+    stage6.add_argument(
+        "--save-model",
+        action="store_true",
+        help="Save generalized DualDomainHighPitchNet weights to <data-root>/manifests/stage6_generalized_dual_domain.pt",
+    )
+    stage6.add_argument(
+        "--run-phantom-check",
+        action="store_true",
+        help="Run Stage 6 synthetic multi-phantom zero-leakage generalization check",
+    )
+    stage6.add_argument("--workers", type=int, default=4)
+    stage6.add_argument("--no-progress", action="store_true")
 
     environment = sub.add_parser(
         "env", help="Report Kaggle/Full profile, disk quota, RAM, disk space, and GPUs"
@@ -2568,6 +2821,180 @@ def main(argv: list[str] | None = None) -> int:
             "synthetic_phantom_dl_check": phantom_stage5,
         }
         out_json = env_prof.data_root / "manifests" / "stage5_dl_report.json"
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report["report_json"] = str(out_json)
+        print(json.dumps(report, indent=2))
+        return 0 if all_pass else 1
+
+    if args.command in ("stage6-generalize", "stage6-eval"):
+        if args.workers < 1:
+            raise SystemExit("--workers must be at least 1")
+        t_start = time.monotonic()
+        env_prof = resolve_environment_profile(data_root=args.data_root)
+        show_prog = not args.no_progress
+        figures_dir = env_prof.data_root / "manifests" / "figures"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        fname = normalize_filter_name(args.filter_name)
+
+        pitch_list = [float(p.strip()) for p in str(args.pitches).split(",") if p.strip()]
+        if not pitch_list:
+            raise SystemExit("--pitches must specify at least one high-pitch target")
+        scenarios_list = (
+            ["itf", "rdc"] if args.scenario == "both" else [args.scenario.strip().lower()]
+        )
+
+        targets = _resolve_cli_series_targets(
+            env_prof.data_root / "raw" / "tcia",
+            case_id=args.case_id,
+            series_dir=args.series_dir,
+            image_dir=args.image_dir,
+            allow_empty_for_phantom=bool(args.run_phantom_check),
+        )
+
+        all_pass = True
+        real_generalization: dict[str, Any] | None = None
+
+        if targets:
+            tr_cases = (
+                [c.strip() for c in str(args.train_cases).split(",") if c.strip()]
+                if getattr(args, "train_cases", None)
+                else None
+            )
+            te_cases = (
+                [c.strip() for c in str(args.test_cases).split(",") if c.strip()]
+                if getattr(args, "test_cases", None)
+                else None
+            )
+            sim_backend = "torch_cuda" if args.backend == "torch_cuda" else "numpy"
+            split = build_real_series_generalization_split(
+                targets,
+                split_mode=args.split_mode,
+                train_case_ids=tr_cases,
+                test_case_ids=te_cases,
+                n_train_slices_per_case=int(args.train_slices_per_case),
+                n_test_slices_per_case=int(args.test_slices_per_case),
+                min_guardband_mm=float(args.min_guardband_mm),
+                pitches=pitch_list,
+                scenarios=scenarios_list,
+                image_size=int(args.image_size),
+                fov_mm=args.fov_mm,
+                filter_name=fname,
+                cutoff_ratio=float(args.cutoff_ratio),
+                inpaint_mode=args.inpaint_mode,
+                itf_slab_slices=int(args.itf_slab_slices),
+                backend=sim_backend,
+                workers=int(args.workers),
+                show_progress=show_prog,
+            )
+            audit_obj = split["zero_leakage_audit"]
+            exp_res = run_generalization_experiment(
+                split["train_samples"],
+                split["test_samples"],
+                split_mode=split["split_mode"],
+                min_guardband_mm=float(args.min_guardband_mm),
+                itf_slab_half_span_mm=float(audit_obj.itf_slab_half_span_mm),
+                sino_base_channels=int(args.sino_channels),
+                img_base_channels=int(args.img_channels),
+                filter_name=fname,
+                cutoff_ratio=float(args.cutoff_ratio),
+                epochs=int(args.epochs),
+                lr=float(args.lr),
+                itf_ratio=float(args.itf_ratio),
+                backend=args.backend,
+                seed=42,
+            )
+
+            test_preds = exp_res["unseen_test_predictions"]
+            disp_pred = test_preds[len(test_preds) // 2]
+            mid_pitch = pitch_list[len(pitch_list) // 2]
+            for p in test_preds:
+                if p.sample.scenario == "itf" and abs(p.sample.target_pitch - mid_pitch) < 0.15:
+                    disp_pred = p
+                    break
+
+            train_cids_str = ",".join(exp_res["zero_leakage_audit"]["train_case_ids"])
+            test_cid_str = disp_pred.sample.case_id
+            qa_png = save_stage6_generalization_visual_qa(
+                figures_dir / f"stage6_{test_cid_str}_generalization_visual_qa.png",
+                title_prefix=f"Stage 6 Real-Data Generalization QA ({test_cid_str})",
+                split_mode=split["split_mode"],
+                train_cases_str=train_cids_str,
+                test_case_id=test_cid_str,
+                scenario=disp_pred.sample.scenario,
+                target_pitch=disp_pred.sample.target_pitch,
+                effective_pitch=disp_pred.sample.effective_pitch,
+                native_pitch=disp_pred.sample.native_pitch,
+                z_slice_mm=disp_pred.sample.z_slice_mm,
+                fov_mm=disp_pred.sample.fov_mm,
+                fov_mask=disp_pred.sample.fov_mask,
+                filter_name=fname,
+                s_hp_raw=disp_pred.sample.s_hp_raw,
+                mask_hp=disp_pred.sample.mask_hp,
+                s_dc=disp_pred.s_dc,
+                x_target_hu=disp_pred.sample.x_target_hu,
+                x_prelim_hu=disp_pred.sample.x_prelim_hu,
+                x_dc_hu=disp_pred.x_dc_hu,
+                x_final_hu=disp_pred.x_final_hu,
+                prelim_metrics=disp_pred.prelim_metrics,
+                domain1_dc_metrics=disp_pred.domain1_dc_metrics,
+                final_dual_metrics=disp_pred.final_dual_metrics,
+                sino_metrics=disp_pred.sinogram_progression_metrics,
+                display_vmax_hu=400.0,
+            )
+
+            gen_m = exp_res["generalization_metrics"]
+            real_pass = bool(
+                gen_m["zero_leakage_verified"]
+                and gen_m["unseen_test_monotonic_pass"]
+                and gen_m["unseen_test_measured_rays_max_abs_dev"] == 0.0
+            )
+            if not real_pass:
+                all_pass = False
+
+            real_generalization = {
+                "pass": real_pass,
+                "split_mode": split["split_mode"],
+                "case_metadata": split["case_metadata"],
+                "zero_leakage_audit": exp_res["zero_leakage_audit"],
+                "generalization_metrics": gen_m,
+                "train_summary": exp_res["train_summary"],
+                "unseen_test_summary": exp_res["unseen_test_summary"],
+                "visual_qa_png": str(qa_png),
+            }
+
+            if getattr(args, "save_model", False):
+                ckpt_path = save_dual_domain_checkpoint(
+                    env_prof.data_root / "manifests" / "stage6_generalized_dual_domain.pt",
+                    exp_res["model"],
+                    summary=exp_res["unseen_test_summary"],
+                    sino_base_channels=int(args.sino_channels),
+                    img_base_channels=int(args.img_channels),
+                    filter_name=fname,
+                    cutoff_ratio=float(args.cutoff_ratio),
+                )
+                real_generalization["model_checkpoint_pt"] = str(ckpt_path)
+
+        phantom_stage6 = None
+        if args.run_phantom_check:
+            phantom_stage6 = _run_stage6_synthetic_generalization_check(
+                figures_dir=figures_dir,
+                filter_name=fname,
+                backend=args.backend,
+                epochs=min(max(4, args.epochs), 10),
+                itf_ratio=float(args.itf_ratio),
+            )
+            if not phantom_stage6["pass"]:
+                all_pass = False
+
+        report = {
+            "stage": "Stage 6 (v0.9.0)",
+            "overall_pass": all_pass,
+            "elapsed_seconds": round(time.monotonic() - t_start, 3),
+            "real_patient_generalization": real_generalization,
+            "synthetic_multi_phantom_generalization": phantom_stage6,
+        }
+        out_json = env_prof.data_root / "manifests" / "stage6_generalization_report.json"
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
         report["report_json"] = str(out_json)
