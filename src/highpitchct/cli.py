@@ -1359,14 +1359,14 @@ def _parser() -> argparse.ArgumentParser:
     stage5.add_argument(
         "--sino-channels",
         type=int,
-        default=24,
-        help="Base channel width for Domain-1 SinoInpaintUNet (default: 24)",
+        default=64,
+        help="Base channel width for 4-level Domain-1 SinoInpaintUNet: 64->128->256->512 (default: 64)",
     )
     stage5.add_argument(
         "--img-channels",
         type=int,
-        default=24,
-        help="Base channel width for Domain-2 ImageRefineUNet (default: 24)",
+        default=64,
+        help="Base channel width for 4-level Domain-2 ImageRefineUNet: 64->128->256->512 (default: 64)",
     )
     stage5.add_argument(
         "--backend",
@@ -2560,7 +2560,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 5 (v0.8.1)",
+            "stage": "Stage 5 (v0.8.2)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "trained_series_count": len(trained_series),

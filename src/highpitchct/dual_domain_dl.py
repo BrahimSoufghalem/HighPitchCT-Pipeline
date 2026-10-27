@@ -441,25 +441,33 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             return apply_hard_data_consistency(s_hp_raw, mask_hp, s_pred)
 
     class SinoInpaintUNet(nn.Module):
-        """Domain-1 Physics-Conditioned Sinogram Missing-Wedge Inpainting Network (`SinoNet`).
+        """Domain-1 Physics-Conditioned 4-Level Sinogram Missing-Wedge Residual U-Net (`SinoNet`).
 
-        Predicts a residual correction `delta_s` on top of the reprojected sinogram `s_reproj`
-        (`Fig. 2(d)`) and projects the result through `HardDataConsistencyLayer` so measured rays
-        (`mask_hp == 1`) remain 100% untouched.
+        Follows the 4-level encoder-decoder topology of AAPM 2026 Fig. 3:
+          - Encoder: `c1 (64) -> c2 (128) -> c3 (256) -> c4 (512)` via `AvgPool2d(2)`
+          - Bottleneck: `c4 (512)` with angular dilated residual convolution (`dilation=(2, 1)`)
+          - Decoder: `c4 (512) -> c3 (256) -> c2 (128) -> c1 (64)` via `Bilinear Upsampling + 3x3 Conv`
+            with 4 multi-scale skip connections (`concat`)
+          - Global Residual (`+`) on `s_reproj` (`Fig. 2(d)`) followed by `HardDataConsistencyLayer`
+            so measured rays (`mask_hp == 1`) remain 100% untouched.
         """
 
-        def __init__(self, in_channels: int = 4, base_channels: int = 24) -> None:
+        def __init__(self, in_channels: int = 4, base_channels: int = 64) -> None:
             super().__init__()
             c1 = int(base_channels)
             c2 = c1 * 2
             c3 = c1 * 4
+            c4 = c1 * 8
 
             self.enc1 = _ConvResBlock2D(in_channels, c1)
             self.enc2 = _ConvResBlock2D(c1, c2)
-            self.bottleneck = _ConvResBlock2D(c2, c3)
+            self.enc3 = _ConvResBlock2D(c2, c3)
+            self.enc4 = _ConvResBlock2D(c3, c4)
+
+            self.bottleneck = _ConvResBlock2D(c4, c4)
             self.bottleneck_dilated = nn.Conv2d(
-                c3,
-                c3,
+                c4,
+                c4,
                 kernel_size=3,
                 dilation=(2, 1),
                 padding=(2, 1),
@@ -472,8 +480,11 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             with torch.no_grad():
                 self.bottleneck_dilated.weight.mul_(0.25)
 
+            self.dec4 = _ConvResBlock2D(c4 + c4, c4)
+            self.dec3 = _ConvResBlock2D(c4 + c3, c3)
             self.dec2 = _ConvResBlock2D(c3 + c2, c2)
             self.dec1 = _ConvResBlock2D(c2 + c1, c1)
+
             self.head = nn.Conv2d(c1, 1, kernel_size=3, padding=1, padding_mode="replicate")
             nn.init.kaiming_normal_(self.head.weight, nonlinearity="linear")
             with torch.no_grad():
@@ -494,10 +505,19 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             p1 = F.avg_pool2d(e1, kernel_size=2, stride=2, ceil_mode=True)
             e2 = self.enc2(p1)
             p2 = F.avg_pool2d(e2, kernel_size=2, stride=2, ceil_mode=True)
-            b = self.bottleneck(p2)
+            e3 = self.enc3(p2)
+            p3 = F.avg_pool2d(e3, kernel_size=2, stride=2, ceil_mode=True)
+            e4 = self.enc4(p3)
+            p4 = F.avg_pool2d(e4, kernel_size=2, stride=2, ceil_mode=True)
+
+            b = self.bottleneck(p4)
             b = b + self.bottleneck_act(self.bottleneck_dilated(b))
 
-            u2 = F.interpolate(b, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+            u4 = F.interpolate(b, size=e4.shape[-2:], mode="bilinear", align_corners=False)
+            d4 = self.dec4(torch.cat([u4, e4], dim=1))
+            u3 = F.interpolate(d4, size=e3.shape[-2:], mode="bilinear", align_corners=False)
+            d3 = self.dec3(torch.cat([u3, e3], dim=1))
+            u2 = F.interpolate(d3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
             d2 = self.dec2(torch.cat([u2, e2], dim=1))
             u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
             d1 = self.dec1(torch.cat([u1, e1], dim=1))
@@ -734,20 +754,21 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             return hu_slice, mu_slice, fov_mask
 
     class ImageRefineUNet(nn.Module):
-        """Domain-2 Physics-Conditioned Image-Domain Artifact Refinement Network (`ImgNet`).
+        """Domain-2 Physics-Conditioned 4-Level Image-Domain Residual U-Net (`ImgNet`).
 
-        Takes the 3-channel tensor `[x_dc_norm, x_prelim_norm, fov_pitch_map]` and predicts
-        residual streak-removal corrections inside `fov_mask` while preserving `ram_lak` edges.
-        Includes a physical `Missing-Wedge Gate` (`wedge_gate = clip((missing_fraction - 0.035) / 0.18, 0, 1)`)
-        so nearly complete short-scan acquisitions (`p = 1.5`, `missing_fraction <= 3.5%`) pass through
-        unperturbed (`x_final_hu == x_dc_hu`), while severe missing-wedge acquisitions (`p = 2.0, 2.5`)
-        receive full Domain-2 streak suppression.
+        Follows the 4-level encoder-decoder topology of AAPM 2026 Fig. 3:
+          - Encoder: `c1 (64) -> c2 (128) -> c3 (256) -> c4 (512)` via `AvgPool2d(2)`
+          - Bottleneck: `c4 (512)`
+          - Decoder: `c4 (512) -> c3 (256) -> c2 (128) -> c1 (64)` via `Bilinear Upsampling + 3x3 Conv`
+            with 4 multi-scale skip connections (`concat`)
+          - Global Residual (`+`) on `x_dc_hu` with a physical `Missing-Wedge Gate`
+            (`wedge_gate = clip((missing_fraction - 0.035) / 0.18, 0, 1)`) inside `fov_mask`.
         """
 
         def __init__(
             self,
             in_channels: int = 3,
-            base_channels: int = 24,
+            base_channels: int = 64,
             hu_scale: float = 1000.0,
         ) -> None:
             super().__init__()
@@ -755,12 +776,20 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             c1 = int(base_channels)
             c2 = c1 * 2
             c3 = c1 * 4
+            c4 = c1 * 8
 
             self.enc1 = _ConvResBlock2D(in_channels, c1)
             self.enc2 = _ConvResBlock2D(c1, c2)
-            self.bottleneck = _ConvResBlock2D(c2, c3)
+            self.enc3 = _ConvResBlock2D(c2, c3)
+            self.enc4 = _ConvResBlock2D(c3, c4)
+
+            self.bottleneck = _ConvResBlock2D(c4, c4)
+
+            self.dec4 = _ConvResBlock2D(c4 + c4, c4)
+            self.dec3 = _ConvResBlock2D(c4 + c3, c3)
             self.dec2 = _ConvResBlock2D(c3 + c2, c2)
             self.dec1 = _ConvResBlock2D(c2 + c1, c1)
+
             self.head = nn.Conv2d(c1, 1, kernel_size=3, padding=1, padding_mode="replicate")
             nn.init.kaiming_normal_(self.head.weight, nonlinearity="linear")
             with torch.no_grad():
@@ -789,9 +818,18 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             p1 = F.avg_pool2d(e1, kernel_size=2, stride=2, ceil_mode=True)
             e2 = self.enc2(p1)
             p2 = F.avg_pool2d(e2, kernel_size=2, stride=2, ceil_mode=True)
-            b = self.bottleneck(p2)
+            e3 = self.enc3(p2)
+            p3 = F.avg_pool2d(e3, kernel_size=2, stride=2, ceil_mode=True)
+            e4 = self.enc4(p3)
+            p4 = F.avg_pool2d(e4, kernel_size=2, stride=2, ceil_mode=True)
 
-            u2 = F.interpolate(b, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+            b = self.bottleneck(p4)
+
+            u4 = F.interpolate(b, size=e4.shape[-2:], mode="bilinear", align_corners=False)
+            d4 = self.dec4(torch.cat([u4, e4], dim=1))
+            u3 = F.interpolate(d4, size=e3.shape[-2:], mode="bilinear", align_corners=False)
+            d3 = self.dec3(torch.cat([u3, e3], dim=1))
+            u2 = F.interpolate(d3, size=e2.shape[-2:], mode="bilinear", align_corners=False)
             d2 = self.dec2(torch.cat([u2, e2], dim=1))
             u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
             d1 = self.dec1(torch.cat([u1, e1], dim=1))
@@ -811,8 +849,8 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
         def __init__(
             self,
             *,
-            sino_base_channels: int = 24,
-            img_base_channels: int = 24,
+            sino_base_channels: int = 64,
+            img_base_channels: int = 64,
             filter_name: str = "ram_lak",
             cutoff_ratio: float = 1.0,
             lateral_pad_cols: int = 96,
@@ -827,17 +865,16 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             )
             self.img_net = ImageRefineUNet(in_channels=3, base_channels=img_base_channels)
 
-        def forward_sample(
+        def forward_domain1(
             self,
             sample: DualDomainSample,
             *,
             device: torch.device,
         ) -> dict[str, torch.Tensor]:
-            """Run full end-to-end Dual-Domain forward pass on a `DualDomainSample`."""
+            """Run Domain-1 (`SinoInpaintUNet + HardDC + DifferentiableParkerFBPBridge`) on a sample."""
             s_hp_t = torch.as_tensor(sample.s_hp_raw, dtype=torch.float32, device=device).unsqueeze(0)
             s_rep_t = torch.as_tensor(sample.s_reproj_dc, dtype=torch.float32, device=device).unsqueeze(0)
             mask_t = torch.as_tensor(sample.mask_hp, dtype=torch.bool, device=device).unsqueeze(0)
-            x_pre_t = torch.as_tensor(sample.x_prelim_hu, dtype=torch.float32, device=device)
 
             s_dc_b, s_pred_b = self.sino_net(
                 s_hp_t, s_rep_t, mask_t, float(sample.effective_pitch)
@@ -857,7 +894,29 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
                 water_mu_mm_inv=sample.water_mu_mm_inv,
                 angular_mode=sample.angular_mode,
             )
+            return {
+                "s_pred_raw": s_pred_raw,
+                "s_dc": s_dc,
+                "x_dc_hu": x_dc_hu,
+                "mu_dc": mu_dc,
+                "fov_mask": fov_mask_t,
+            }
 
+        def forward_sample(
+            self,
+            sample: DualDomainSample,
+            *,
+            device: torch.device,
+        ) -> dict[str, torch.Tensor]:
+            """Run full end-to-end Dual-Domain forward pass on a `DualDomainSample`."""
+            d1_out = self.forward_domain1(sample, device=device)
+            s_pred_raw = d1_out["s_pred_raw"]
+            s_dc = d1_out["s_dc"]
+            x_dc_hu = d1_out["x_dc_hu"]
+            mu_dc = d1_out["mu_dc"]
+            fov_mask_t = d1_out["fov_mask"]
+
+            x_pre_t = torch.as_tensor(sample.x_prelim_hu, dtype=torch.float32, device=device)
             x_final_hu = self.img_net(
                 x_dc_hu,
                 x_pre_t,
@@ -893,8 +952,8 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
 
 def create_dual_domain_model(
     *,
-    sino_base_channels: int = 24,
-    img_base_channels: int = 24,
+    sino_base_channels: int = 64,
+    img_base_channels: int = 64,
     filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     lateral_pad_cols: int = 96,
@@ -923,7 +982,7 @@ def compute_dual_domain_physics_loss(
     *,
     device: Any,
     lambda_sino_wedge: float = 1.5,
-    lambda_sino_grad: float = 0.25,
+    lambda_sino_grad: float = 0.30,
     lambda_dc_img: float = 0.35,
     lambda_final_img: float = 1.0,
     lambda_edge_grad: float = 0.25,
@@ -931,13 +990,10 @@ def compute_dual_domain_physics_loss(
 ) -> dict[str, Any]:
     """Compute the composite Physics-Informed Dual-Domain training loss for a `DualDomainSample`.
 
-    Components:
-      1. `sino_wedge_loss`: L1 + Smooth-L1 loss inside the unmeasured angular wedge `(1 - mask_hp)`
-         plus angular continuity penalty `|d_beta s_dc - d_beta s_target|` across wedge boundaries.
-      2. `dc_img_loss`: Intermediate image domain loss `|x_dc_hu - x_target_hu| / hu_scale` inside
-         `fov_mask` (supervising `SinoNet` directly through the differentiable `Ram-Lak` FBP bridge).
-      3. `final_img_loss`: Final image domain L1 + Smooth-L1 + spatial gradient preservation loss
-         `|grad(x_final_hu) - grad(x_target_hu)|` inside `fov_mask`.
+    Implements the AAPM 2026 Poster loss equations (`Eq. 1–3`) alongside physical consistency terms:
+      - `sino_pretrain_loss` (`Eq. 1`): `L1(s_dc, s*) + 0.3 * L_grad(s_dc, s*) + 0.35 * L_dc_img`
+      - `img_pretrain_loss` (`Eq. 2`): `L1(x_final, x*) + 0.25 * L_grad(x_final, x*)`
+      - `joint_finetune_loss` (`Eq. 3`): `1.0 * L_img(x_final, x*) + 0.02 * L1(s_dc, s*) + 0.01 * L_grad(s_dc, s*) + 0.35 * L_dc_img`
     """
     import torch
     import torch.nn.functional as F
@@ -960,10 +1016,14 @@ def compute_dual_domain_physics_loss(
     else:
         loss_sino_w = torch.mean(torch.abs(s_dc - s_target_t))
 
-    # Angular continuity gradient along beta axis (prevents seam impulses in Ram-Lak filter)
+    # 2D sinogram gradient difference loss L_grad(s_dc, s*) along both angle beta and detector u
     db_pred = s_dc[1:, :] - s_dc[:-1, :]
     db_tgt = s_target_t[1:, :] - s_target_t[:-1, :]
-    loss_sino_grad = torch.mean(torch.abs(db_pred - db_tgt))
+    du_pred = s_dc[:, 1:] - s_dc[:, :-1]
+    du_tgt = s_target_t[:, 1:] - s_target_t[:, :-1]
+    loss_sino_grad = 0.5 * (
+        torch.mean(torch.abs(db_pred - db_tgt)) + torch.mean(torch.abs(du_pred - du_tgt))
+    )
 
     # Intermediate FBP Bridge image loss inside FOV
     dc_diff_norm = (x_dc_hu[fov_mask] - x_target_t[fov_mask]) / float(hu_scale)
@@ -983,6 +1043,18 @@ def compute_dual_domain_physics_loss(
     gy_tgt = (x_target_t[1:, :] - x_target_t[:-1, :]) / float(hu_scale)
     loss_edge = 0.5 * (torch.mean(torch.abs(gx_fin - gx_tgt)) + torch.mean(torch.abs(gy_fin - gy_tgt)))
 
+    # Poster Eq. (1): Sinogram U-Net Pretraining objective
+    sino_pretrain_loss = loss_sino_w + 0.30 * loss_sino_grad + float(lambda_dc_img) * loss_dc_img
+    # Poster Eq. (2): Image U-Net Pretraining objective
+    img_pretrain_loss = loss_fin_l1 + float(lambda_edge_grad) * loss_edge
+    # Poster Eq. (3): End-to-End Fine-Tuning objective
+    joint_finetune_loss = (
+        1.0 * img_pretrain_loss
+        + 0.02 * loss_sino_w
+        + 0.01 * loss_sino_grad
+        + float(lambda_dc_img) * loss_dc_img
+    )
+
     total = (
         float(lambda_sino_wedge) * loss_sino_w
         + float(lambda_sino_grad) * loss_sino_grad
@@ -992,6 +1064,9 @@ def compute_dual_domain_physics_loss(
     )
     return {
         "total_loss": total,
+        "sino_pretrain_loss": sino_pretrain_loss,
+        "img_pretrain_loss": img_pretrain_loss,
+        "joint_finetune_loss": joint_finetune_loss,
         "sino_wedge_loss": loss_sino_w.detach(),
         "sino_grad_loss": loss_sino_grad.detach(),
         "dc_img_loss": loss_dc_img.detach(),
@@ -1101,6 +1176,37 @@ def build_weighted_hybrid_curriculum(
     return [(s, w_itf if s.scenario == "itf" else w_rdc) for s in samples]
 
 
+def _resolve_three_stage_epoch_split(
+    epochs: int,
+    *,
+    sino_pretrain_epochs: int | None = None,
+    img_pretrain_epochs: int | None = None,
+    joint_finetune_epochs: int | None = None,
+) -> tuple[int, int, int]:
+    """Split total epochs across Stage 1 (`Eq. 1`), Stage 2 (`Eq. 2`), and Stage 3 (`Eq. 3`)."""
+    if (
+        sino_pretrain_epochs is not None
+        or img_pretrain_epochs is not None
+        or joint_finetune_epochs is not None
+    ):
+        n1 = max(0, int(sino_pretrain_epochs or 0))
+        n2 = max(0, int(img_pretrain_epochs or 0))
+        n3 = max(0, int(joint_finetune_epochs or 0))
+        if n1 + n2 + n3 < 1:
+            raise ValueError("Total epochs across the 3 training stages must be >= 1")
+        return n1, n2, n3
+
+    total = int(epochs)
+    if total == 1:
+        return 0, 0, 1
+    if total == 2:
+        return 1, 0, 1
+    n1 = max(1, int(round(0.40 * total)))
+    n2 = max(1, int(round(0.30 * total)))
+    n3 = max(1, total - n1 - n2)
+    return n1, n2, n3
+
+
 def train_dual_domain_model(
     model: Any,
     samples: Sequence[DualDomainSample],
@@ -1110,8 +1216,21 @@ def train_dual_domain_model(
     lr: float = 2.5e-3,
     itf_ratio: float = DEFAULT_ITF_TRAINING_RATIO,
     seed: int = 42,
+    sino_pretrain_epochs: int | None = None,
+    img_pretrain_epochs: int | None = None,
+    joint_finetune_epochs: int | None = None,
 ) -> dict[str, Any]:
-    """Train `DualDomainHighPitchNet` with `60% ITF / 40% RDC` multi-pitch curriculum weighting."""
+    """Train `DualDomainHighPitchNet` using the 3-Stage AAPM 2026 Poster protocol (`Eq. 1 -> Eq. 2 -> Eq. 3`).
+
+    Stages:
+      1. `stage1_sino_pretrain` (`Eq. 1`): Pretrains `SinoInpaintUNet` individually with
+         `L_sino-pre = L1(s_dc, s*) + 0.3 * L_grad(s_dc, s*) + 0.35 * L_dc_img`.
+      2. `stage2_img_pretrain` (`Eq. 2`): Freezes `SinoInpaintUNet`, caches `x_dc_hu = FBP(s_dc)`,
+         and pretrains `ImageRefineUNet` individually with `L_img-pre = L1(x_final, x*) + 0.25 * L_grad(x_final, x*)`.
+      3. `stage3_joint_finetune` (`Eq. 3`): Unfreezes both networks and fine-tunes end-to-end through
+         `DifferentiableParkerFBPBridge` (`ram_lak`) with
+         `L_joint = 1.0 * L_img(x_final, x*) + 0.02 * L1(s_dc, s*) + 0.01 * L_grad(s_dc, s*) + 0.35 * L_dc_img`.
+    """
     import torch
 
     if not samples:
@@ -1119,63 +1238,258 @@ def train_dual_domain_model(
     if int(epochs) < 1:
         raise ValueError(f"epochs must be >= 1, got {epochs}")
 
-    curriculum = build_weighted_hybrid_curriculum(samples, itf_ratio=itf_ratio)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, int(epochs)), eta_min=float(lr) * 0.15
+    n_sino, n_img, n_joint = _resolve_three_stage_epoch_split(
+        int(epochs),
+        sino_pretrain_epochs=sino_pretrain_epochs,
+        img_pretrain_epochs=img_pretrain_epochs,
+        joint_finetune_epochs=joint_finetune_epochs,
     )
-
+    curriculum = build_weighted_hybrid_curriculum(samples, itf_ratio=itf_ratio)
     rng = np.random.default_rng(int(seed))
-    history: list[dict[str, float]] = []
-    best_loss = float("inf")
-    best_state: dict[str, Any] | None = None
+    history: list[dict[str, Any]] = []
+    epoch_counter = 0
 
-    for ep in range(int(epochs)):
-        model.train()
-        order = rng.permutation(len(curriculum))
-        ep_total = 0.0
-        ep_sino = 0.0
-        ep_dc_img = 0.0
-        ep_fin_img = 0.0
-        w_sum = 0.0
+    # -------------------------------------------------------------------------
+    # STAGE 1: Sinogram U-Net Pretraining (Poster Eq. 1)
+    # -------------------------------------------------------------------------
+    if n_sino > 0:
+        for p in model.sino_net.parameters():
+            p.requires_grad_(True)
+        for p in model.img_net.parameters():
+            p.requires_grad_(False)
 
-        for idx in order:
-            sample, sample_w = curriculum[int(idx)]
-            optimizer.zero_grad()
-            out = model.forward_sample(sample, device=device)
-            losses = compute_dual_domain_physics_loss(out, sample, device=device)
-            weighted_loss = losses["total_loss"] * float(sample_w)
-            weighted_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-            optimizer.step()
-
-            sw = float(sample_w)
-            w_sum += sw
-            ep_total += float(losses["total_loss"].detach().item()) * sw
-            ep_sino += float(losses["sino_wedge_loss"].item()) * sw
-            ep_dc_img += float(losses["dc_img_loss"].item()) * sw
-            ep_fin_img += float(losses["final_img_loss"].item()) * sw
-
-        scheduler.step()
-        denom = max(w_sum, 1e-8)
-        mean_ep_loss = ep_total / denom
-        if mean_ep_loss <= best_loss:
-            best_loss = mean_ep_loss
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-        history.append(
-            {
-                "epoch": int(ep + 1),
-                "total_loss": round(mean_ep_loss, 6),
-                "sino_wedge_loss": round(ep_sino / denom, 6),
-                "dc_img_loss": round(ep_dc_img / denom, 6),
-                "final_img_loss": round(ep_fin_img / denom, 6),
-                "lr": round(float(scheduler.get_last_lr()[0]), 7),
-            }
+        opt_sino = torch.optim.AdamW(model.sino_net.parameters(), lr=float(lr), weight_decay=1e-4)
+        sched_sino = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_sino, T_max=max(1, n_sino), eta_min=float(lr) * 0.25
         )
+        best_sino_loss = float("inf")
+        best_sino_state: dict[str, Any] | None = None
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+        for _ in range(n_sino):
+            epoch_counter += 1
+            model.sino_net.train()
+            model.img_net.eval()
+            order = rng.permutation(len(curriculum))
+            ep_total = 0.0
+            ep_phase = 0.0
+            ep_sino = 0.0
+            ep_dc_img = 0.0
+            ep_fin_img = 0.0
+            w_sum = 0.0
+
+            for idx in order:
+                sample, sample_w = curriculum[int(idx)]
+                opt_sino.zero_grad()
+                d1_out = model.forward_domain1(sample, device=device)
+                # During Stage 1 pretraining, x_final_hu is evaluated before Domain-2 activates (x_dc_hu)
+                d1_full = {
+                    **d1_out,
+                    "x_final_hu": d1_out["x_dc_hu"],
+                }
+                losses = compute_dual_domain_physics_loss(d1_full, sample, device=device)
+                weighted_loss = losses["sino_pretrain_loss"] * float(sample_w)
+                weighted_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.sino_net.parameters(), max_norm=2.0)
+                opt_sino.step()
+
+                sw = float(sample_w)
+                w_sum += sw
+                ep_total += float(losses["total_loss"].detach().item()) * sw
+                ep_phase += float(losses["sino_pretrain_loss"].detach().item()) * sw
+                ep_sino += float(losses["sino_wedge_loss"].item()) * sw
+                ep_dc_img += float(losses["dc_img_loss"].item()) * sw
+                ep_fin_img += float(losses["final_img_loss"].item()) * sw
+
+            sched_sino.step()
+            denom = max(w_sum, 1e-8)
+            mean_phase_loss = ep_phase / denom
+            if mean_phase_loss <= best_sino_loss:
+                best_sino_loss = mean_phase_loss
+                best_sino_state = {
+                    k: v.detach().clone() for k, v in model.sino_net.state_dict().items()
+                }
+            history.append(
+                {
+                    "epoch": int(epoch_counter),
+                    "phase": "stage1_sino_pretrain",
+                    "total_loss": round(ep_total / denom, 6),
+                    "phase_objective_loss": round(mean_phase_loss, 6),
+                    "sino_wedge_loss": round(ep_sino / denom, 6),
+                    "dc_img_loss": round(ep_dc_img / denom, 6),
+                    "final_img_loss": round(ep_fin_img / denom, 6),
+                    "lr": round(float(sched_sino.get_last_lr()[0]), 7),
+                }
+            )
+
+        if best_sino_state is not None:
+            model.sino_net.load_state_dict(best_sino_state)
+
+    # -------------------------------------------------------------------------
+    # STAGE 2: Image U-Net Pretraining (Poster Eq. 2)
+    # -------------------------------------------------------------------------
+    if n_img > 0:
+        for p in model.sino_net.parameters():
+            p.requires_grad_(False)
+        for p in model.img_net.parameters():
+            p.requires_grad_(True)
+
+        # Cache fixed Domain-1 outputs (s_dc, x_dc_hu, fov_mask) once so Stage 2 runs rapidly
+        model.sino_net.eval()
+        cached_d1: list[dict[str, Any]] = []
+        with torch.no_grad():
+            for sample, _ in curriculum:
+                d1_out = model.forward_domain1(sample, device=device)
+                cached_d1.append(
+                    {
+                        "s_pred_raw": d1_out["s_pred_raw"].detach(),
+                        "s_dc": d1_out["s_dc"].detach(),
+                        "x_dc_hu": d1_out["x_dc_hu"].detach(),
+                        "mu_dc": d1_out["mu_dc"].detach(),
+                        "fov_mask": d1_out["fov_mask"].detach(),
+                    }
+                )
+
+        opt_img = torch.optim.AdamW(model.img_net.parameters(), lr=float(lr), weight_decay=1e-4)
+        sched_img = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_img, T_max=max(1, n_img), eta_min=float(lr) * 0.25
+        )
+        best_img_loss = float("inf")
+        best_img_state: dict[str, Any] | None = None
+
+        for _ in range(n_img):
+            epoch_counter += 1
+            model.img_net.train()
+            order = rng.permutation(len(curriculum))
+            ep_total = 0.0
+            ep_phase = 0.0
+            ep_sino = 0.0
+            ep_dc_img = 0.0
+            ep_fin_img = 0.0
+            w_sum = 0.0
+
+            for idx in order:
+                c_idx = int(idx)
+                sample, sample_w = curriculum[c_idx]
+                d1_c = cached_d1[c_idx]
+                opt_img.zero_grad()
+
+                x_pre_t = torch.as_tensor(sample.x_prelim_hu, dtype=torch.float32, device=device)
+                x_final_hu = model.img_net(
+                    d1_c["x_dc_hu"],
+                    x_pre_t,
+                    d1_c["fov_mask"],
+                    float(sample.effective_pitch),
+                    missing_fraction=float(sample.missing_fraction),
+                )
+                full_out = {
+                    **d1_c,
+                    "x_final_hu": x_final_hu,
+                }
+                losses = compute_dual_domain_physics_loss(full_out, sample, device=device)
+                weighted_loss = losses["img_pretrain_loss"] * float(sample_w)
+                weighted_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.img_net.parameters(), max_norm=2.0)
+                opt_img.step()
+
+                sw = float(sample_w)
+                w_sum += sw
+                ep_total += float(losses["total_loss"].detach().item()) * sw
+                ep_phase += float(losses["img_pretrain_loss"].detach().item()) * sw
+                ep_sino += float(losses["sino_wedge_loss"].item()) * sw
+                ep_dc_img += float(losses["dc_img_loss"].item()) * sw
+                ep_fin_img += float(losses["final_img_loss"].item()) * sw
+
+            sched_img.step()
+            denom = max(w_sum, 1e-8)
+            mean_phase_loss = ep_phase / denom
+            if mean_phase_loss <= best_img_loss:
+                best_img_loss = mean_phase_loss
+                best_img_state = {
+                    k: v.detach().clone() for k, v in model.img_net.state_dict().items()
+                }
+            history.append(
+                {
+                    "epoch": int(epoch_counter),
+                    "phase": "stage2_img_pretrain",
+                    "total_loss": round(ep_total / denom, 6),
+                    "phase_objective_loss": round(mean_phase_loss, 6),
+                    "sino_wedge_loss": round(ep_sino / denom, 6),
+                    "dc_img_loss": round(ep_dc_img / denom, 6),
+                    "final_img_loss": round(ep_fin_img / denom, 6),
+                    "lr": round(float(sched_img.get_last_lr()[0]), 7),
+                }
+            )
+
+        if best_img_state is not None:
+            model.img_net.load_state_dict(best_img_state)
+
+    # -------------------------------------------------------------------------
+    # STAGE 3: End-to-End Joint Fine-Tuning (Poster Eq. 3)
+    # -------------------------------------------------------------------------
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+    if n_joint > 0:
+        joint_lr = float(lr) * (0.65 if (n_sino > 0 or n_img > 0) else 1.0)
+        opt_joint = torch.optim.AdamW(model.parameters(), lr=joint_lr, weight_decay=1e-4)
+        sched_joint = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_joint, T_max=max(1, n_joint), eta_min=joint_lr * 0.15
+        )
+        best_joint_loss = float("inf")
+        best_joint_state: dict[str, Any] | None = None
+
+        for _ in range(n_joint):
+            epoch_counter += 1
+            model.train()
+            order = rng.permutation(len(curriculum))
+            ep_total = 0.0
+            ep_phase = 0.0
+            ep_sino = 0.0
+            ep_dc_img = 0.0
+            ep_fin_img = 0.0
+            w_sum = 0.0
+
+            for idx in order:
+                sample, sample_w = curriculum[int(idx)]
+                opt_joint.zero_grad()
+                out = model.forward_sample(sample, device=device)
+                losses = compute_dual_domain_physics_loss(out, sample, device=device)
+                weighted_loss = losses["joint_finetune_loss"] * float(sample_w)
+                weighted_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                opt_joint.step()
+
+                sw = float(sample_w)
+                w_sum += sw
+                ep_total += float(losses["total_loss"].detach().item()) * sw
+                ep_phase += float(losses["joint_finetune_loss"].detach().item()) * sw
+                ep_sino += float(losses["sino_wedge_loss"].item()) * sw
+                ep_dc_img += float(losses["dc_img_loss"].item()) * sw
+                ep_fin_img += float(losses["final_img_loss"].item()) * sw
+
+            sched_joint.step()
+            denom = max(w_sum, 1e-8)
+            mean_ep_loss = ep_total / denom
+            mean_phase_loss = ep_phase / denom
+            if mean_ep_loss <= best_joint_loss:
+                best_joint_loss = mean_ep_loss
+                best_joint_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+            history.append(
+                {
+                    "epoch": int(epoch_counter),
+                    "phase": "stage3_joint_finetune",
+                    "total_loss": round(mean_ep_loss, 6),
+                    "phase_objective_loss": round(mean_phase_loss, 6),
+                    "sino_wedge_loss": round(ep_sino / denom, 6),
+                    "dc_img_loss": round(ep_dc_img / denom, 6),
+                    "final_img_loss": round(ep_fin_img / denom, 6),
+                    "lr": round(float(sched_joint.get_last_lr()[0]), 7),
+                }
+            )
+
+        if best_joint_state is not None:
+            model.load_state_dict(best_joint_state)
 
     # Calibrate Domain-2 residual scale so Final Dual-Domain strictly improves or equals Domain-1
     base_img_scale = float(model.img_net.res_scale.detach().item())
@@ -1198,6 +1512,11 @@ def train_dual_domain_model(
     summary = summarize_dual_domain_predictions(
         predictions, itf_ratio=itf_ratio, training_history=history
     )
+    summary["training_stage_epochs"] = {
+        "stage1_sino_pretrain": n_sino,
+        "stage2_img_pretrain": n_img,
+        "stage3_joint_finetune": n_joint,
+    }
     return {
         "history": history,
         "predictions": predictions,
@@ -1763,8 +2082,8 @@ def save_dual_domain_checkpoint(
     model: Any,
     *,
     summary: dict[str, Any] | None = None,
-    sino_base_channels: int = 24,
-    img_base_channels: int = 24,
+    sino_base_channels: int = 64,
+    img_base_channels: int = 64,
     filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     lateral_pad_cols: int = 96,
@@ -1799,8 +2118,8 @@ def load_dual_domain_checkpoint(
     payload = torch.load(Path(ckpt_path), map_location=device, weights_only=False)
     cfg = payload.get("config", {})
     model, _ = create_dual_domain_model(
-        sino_base_channels=int(cfg.get("sino_base_channels", 24)),
-        img_base_channels=int(cfg.get("img_base_channels", 24)),
+        sino_base_channels=int(cfg.get("sino_base_channels", 64)),
+        img_base_channels=int(cfg.get("img_base_channels", 64)),
         filter_name=str(cfg.get("filter_name", "ram_lak")),
         cutoff_ratio=float(cfg.get("cutoff_ratio", 1.0)),
         lateral_pad_cols=int(cfg.get("lateral_pad_cols", 96)),

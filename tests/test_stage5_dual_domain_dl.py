@@ -184,6 +184,23 @@ class TestStage5DualDomainDL(unittest.TestCase):
         self.assertEqual(float(x_img[0, 2, 0, 0]), 0.0)
         self.assertAlmostEqual(float(x_img[0, 2, 4, 4]), 2.5 / 3.0, places=5)
 
+        # 4. Verify 4-level (64 -> 128 -> 256 -> 512 -> 512 -> 256 -> 128 -> 64) Fig. 3 U-Net topology
+        full_model, _ = create_dual_domain_model(backend="torch", seed=42)
+        for net in (full_model.sino_net, full_model.img_net):
+            self.assertEqual(int(net.enc1.conv1.out_channels), 64)
+            self.assertEqual(int(net.enc2.conv1.out_channels), 128)
+            self.assertEqual(int(net.enc3.conv1.out_channels), 256)
+            self.assertEqual(int(net.enc4.conv1.out_channels), 512)
+            self.assertEqual(int(net.bottleneck.conv1.out_channels), 512)
+            self.assertEqual(int(net.dec4.conv1.in_channels), 1024)
+            self.assertEqual(int(net.dec4.conv1.out_channels), 512)
+            self.assertEqual(int(net.dec3.conv1.in_channels), 768)
+            self.assertEqual(int(net.dec3.conv1.out_channels), 256)
+            self.assertEqual(int(net.dec2.conv1.in_channels), 384)
+            self.assertEqual(int(net.dec2.conv1.out_channels), 128)
+            self.assertEqual(int(net.dec1.conv1.in_channels), 192)
+            self.assertEqual(int(net.dec1.conv1.out_channels), 64)
+
     def test_differentiable_parker_ram_lak_fbp_bridge_parity_and_gradients(self) -> None:
         """Prove PyTorch DifferentiableParkerFBPBridge matches NumPy Ram-Lak FBP (<0.05 HU) & flows grads."""
         import torch
@@ -351,6 +368,15 @@ class TestStage5DualDomainDL(unittest.TestCase):
         summary = res["summary"]
         prog = summary["overall_progression"]
 
+        # Verify all 3 sequential AAPM 2026 training phases executed
+        phases_seen = [h["phase"] for h in hist]
+        self.assertIn("stage1_sino_pretrain", phases_seen)
+        self.assertIn("stage2_img_pretrain", phases_seen)
+        self.assertIn("stage3_joint_finetune", phases_seen)
+        self.assertEqual(
+            sum(summary["training_stage_epochs"].values()),
+            6,
+        )
         # Loss must decrease from epoch 1 to final epoch
         self.assertLess(hist[-1]["total_loss"], hist[0]["total_loss"])
         # Final Dual-Domain RMSE must beat preliminary FBP and raw no-fill FBP
