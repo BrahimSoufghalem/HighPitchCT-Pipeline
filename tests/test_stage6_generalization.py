@@ -142,10 +142,47 @@ class TestStage6Generalization(unittest.TestCase):
 
     def test_cli_stage6_generalize_on_multi_patient_synthetic_dicom_series(self) -> None:
         """Verify CLI stage6-generalize runs end-to-end on two distinct patient series (patient_split)."""
+        import numpy as np
+        from pydicom.dataset import FileDataset, FileMetaDataset
+        from pydicom.uid import ExplicitVRLittleEndian
+
         with tempfile.TemporaryDirectory(prefix="hpct_stage6_cli_") as tmp:
             root = Path(tmp)
             pdir_train = root / "raw" / "tcia" / "case_C012" / "projection_full" / "1"
+            idir_train = root / "raw" / "tcia" / "case_C012" / "reconstruction_published" / "1"
             pdir_test = root / "raw" / "tcia" / "case_C027" / "projection_full" / "1"
+
+            idir_train.mkdir(parents=True, exist_ok=True)
+            fm = FileMetaDataset()
+            fm.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.2"
+            fm.MediaStorageSOPInstanceUID = "1.2.826.0.1.3680043.10.999.2001"
+            fm.TransferSyntaxUID = ExplicitVRLittleEndian
+            ct_ds = FileDataset(
+                str(idir_train / "slice_0001.dcm"),
+                {},
+                file_meta=fm,
+                preamble=b"\0" * 128,
+            )
+            ct_ds.SOPClassUID = "1.2.840.10008.5.1.4.1.1.2"
+            ct_ds.SOPInstanceUID = "1.2.826.0.1.3680043.10.999.2001"
+            ct_ds.SeriesInstanceUID = "1.2.826.0.1.3680043.10.999.2000"
+            ct_ds.Modality = "CT"
+            ct_ds.InstanceNumber = 1
+            ct_ds.ImagePositionPatient = [-180.0, -180.0, 0.0]
+            ct_ds.Rows = 64
+            ct_ds.Columns = 64
+            ct_ds.PixelSpacing = [5.625, 5.625]
+            ct_ds.SliceThickness = 1.5
+            ct_ds.BitsAllocated = 16
+            ct_ds.BitsStored = 16
+            ct_ds.HighBit = 15
+            ct_ds.PixelRepresentation = 0
+            ct_ds.SamplesPerPixel = 1
+            ct_ds.PhotometricInterpretation = "MONOCHROME2"
+            ct_ds.RescaleSlope = 1.0
+            ct_ds.RescaleIntercept = -1024.0
+            ct_ds.PixelData = np.full((64, 64), 1024, dtype=np.uint16).tobytes()
+            ct_ds.save_as(str(idir_train / "slice_0001.dcm"), enforce_file_format=True)
 
             geom_train = make_synthetic_helical_geometry(
                 n_views=192,

@@ -476,19 +476,23 @@ def build_real_series_generalization_split(
     def _resolve_case_fov_and_center(
         geom: Any, idir: Path | None
     ) -> tuple[float | None, tuple[float, float]]:
-        case_fov = fov_mm
-        c_xy = (0.0, 0.0)
+        vendor_fov_mm: float | None = None
         if idir is not None and idir.exists():
             vol_meta = read_ct_image_volume(
-                idir, water_mu_mm_inv=geom.water_mu_mm_inv, max_slices=3
+                idir, water_mu_mm_inv=geom.water_mu_mm_inv
             )
-            if case_fov is None:
-                case_fov = float(vol_meta["fov_xy_mm"][0])
-            c_xy = (
-                float(vol_meta["center_xy_mm"][0]),
-                float(vol_meta["center_xy_mm"][1]),
+            ps_yx = vol_meta["pixel_spacing_yx_mm"]
+            vendor_fov_mm = float(vol_meta["shape_zyx"][2]) * float(ps_yx[1])
+        case_fov = (
+            fov_mm
+            if fov_mm is not None
+            else (
+                vendor_fov_mm
+                if vendor_fov_mm is not None and vendor_fov_mm > 0.0
+                else None
             )
-        return case_fov, c_xy
+        )
+        return case_fov, (0.0, 0.0)
 
     train_samples: list[DualDomainSample] = []
     test_samples: list[DualDomainSample] = []
