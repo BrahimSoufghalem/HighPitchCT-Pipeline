@@ -2560,7 +2560,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 5 (v0.8.0)",
+            "stage": "Stage 5 (v0.8.1)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "trained_series_count": len(trained_series),

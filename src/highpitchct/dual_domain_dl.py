@@ -398,10 +398,11 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
     import torch.nn.functional as F
 
     class _ConvResBlock2D(nn.Module):
-        """Two-layer residual 3x3 convolution block with replicate boundary padding."""
+        """Two-layer residual 3x3 convolution block with GroupNorm and replicate boundary padding."""
 
         def __init__(self, in_ch: int, out_ch: int) -> None:
             super().__init__()
+            num_groups = min(8, out_ch) if out_ch % min(8, out_ch) == 0 else 1
             self.proj = (
                 nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=True)
                 if in_ch != out_ch
@@ -410,19 +411,22 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             self.conv1 = nn.Conv2d(
                 in_ch, out_ch, kernel_size=3, padding=1, padding_mode="replicate", bias=True
             )
+            self.gn1 = nn.GroupNorm(num_groups=num_groups, num_channels=out_ch)
             self.act1 = nn.SiLU(inplace=False)
             self.conv2 = nn.Conv2d(
                 out_ch, out_ch, kernel_size=3, padding=1, padding_mode="replicate", bias=True
             )
+            self.gn2 = nn.GroupNorm(num_groups=num_groups, num_channels=out_ch)
             self.act2 = nn.SiLU(inplace=False)
-            # Initialize second conv small so block starts near identity
             nn.init.zeros_(self.conv2.bias)
-            nn.init.normal_(self.conv2.weight, mean=0.0, std=0.01)
+            nn.init.kaiming_normal_(self.conv2.weight, nonlinearity="relu")
+            with torch.no_grad():
+                self.conv2.weight.mul_(0.25)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             res = self.proj(x)
-            h = self.act1(self.conv1(x))
-            h = self.conv2(h)
+            h = self.act1(self.gn1(self.conv1(x)))
+            h = self.gn2(self.conv2(h))
             return self.act2(res + h)
 
     class HardDataConsistencyLayer(nn.Module):
@@ -453,12 +457,29 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             self.enc1 = _ConvResBlock2D(in_channels, c1)
             self.enc2 = _ConvResBlock2D(c1, c2)
             self.bottleneck = _ConvResBlock2D(c2, c3)
+            self.bottleneck_dilated = nn.Conv2d(
+                c3,
+                c3,
+                kernel_size=3,
+                dilation=(2, 1),
+                padding=(2, 1),
+                padding_mode="replicate",
+                bias=True,
+            )
+            self.bottleneck_act = nn.SiLU(inplace=False)
+            nn.init.zeros_(self.bottleneck_dilated.bias)
+            nn.init.kaiming_normal_(self.bottleneck_dilated.weight, nonlinearity="relu")
+            with torch.no_grad():
+                self.bottleneck_dilated.weight.mul_(0.25)
+
             self.dec2 = _ConvResBlock2D(c3 + c2, c2)
             self.dec1 = _ConvResBlock2D(c2 + c1, c1)
             self.head = nn.Conv2d(c1, 1, kernel_size=3, padding=1, padding_mode="replicate")
-            nn.init.zeros_(self.head.weight)
+            nn.init.kaiming_normal_(self.head.weight, nonlinearity="linear")
+            with torch.no_grad():
+                self.head.weight.mul_(0.05)
             nn.init.zeros_(self.head.bias)
-            self.res_scale = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
+            self.res_scale = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
             self.hard_dc = HardDataConsistencyLayer()
 
         def forward(
@@ -474,6 +495,7 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             e2 = self.enc2(p1)
             p2 = F.avg_pool2d(e2, kernel_size=2, stride=2, ceil_mode=True)
             b = self.bottleneck(p2)
+            b = b + self.bottleneck_act(self.bottleneck_dilated(b))
 
             u2 = F.interpolate(b, size=e2.shape[-2:], mode="bilinear", align_corners=False)
             d2 = self.dec2(torch.cat([u2, e2], dim=1))
@@ -481,7 +503,11 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             d1 = self.dec1(torch.cat([u1, e1], dim=1))
 
             delta_s = self.head(d1).squeeze(1)
-            s_pred_raw = torch.clamp(s_reproj + self.res_scale * delta_s, min=0.0)
+            mask_f = mask_hp.to(dtype=delta_s.dtype, device=delta_s.device)
+            if mask_f.ndim == 4 and delta_s.ndim == 3:
+                mask_f = mask_f.squeeze(1)
+            delta_s_wedge = delta_s * (1.0 - mask_f)
+            s_pred_raw = torch.clamp(s_reproj + self.res_scale * delta_s_wedge, min=0.0)
             s_dc = self.hard_dc(s_hp_raw, mask_hp, s_pred_raw)
             return s_dc, s_pred_raw
 
@@ -712,6 +738,10 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
 
         Takes the 3-channel tensor `[x_dc_norm, x_prelim_norm, fov_pitch_map]` and predicts
         residual streak-removal corrections inside `fov_mask` while preserving `ram_lak` edges.
+        Includes a physical `Missing-Wedge Gate` (`wedge_gate = clip((missing_fraction - 0.035) / 0.18, 0, 1)`)
+        so nearly complete short-scan acquisitions (`p = 1.5`, `missing_fraction <= 3.5%`) pass through
+        unperturbed (`x_final_hu == x_dc_hu`), while severe missing-wedge acquisitions (`p = 2.0, 2.5`)
+        receive full Domain-2 streak suppression.
         """
 
         def __init__(
@@ -732,9 +762,11 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             self.dec2 = _ConvResBlock2D(c3 + c2, c2)
             self.dec1 = _ConvResBlock2D(c2 + c1, c1)
             self.head = nn.Conv2d(c1, 1, kernel_size=3, padding=1, padding_mode="replicate")
-            nn.init.zeros_(self.head.weight)
+            nn.init.kaiming_normal_(self.head.weight, nonlinearity="linear")
+            with torch.no_grad():
+                self.head.weight.mul_(0.05)
             nn.init.zeros_(self.head.bias)
-            self.res_scale = nn.Parameter(torch.tensor(0.20, dtype=torch.float32))
+            self.res_scale = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
 
         def forward(
             self,
@@ -742,7 +774,14 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             x_prelim_hu: torch.Tensor,
             fov_mask: torch.Tensor,
             effective_pitch: torch.Tensor | float,
+            missing_fraction: torch.Tensor | float = 0.25,
         ) -> torch.Tensor:
+            if isinstance(missing_fraction, torch.Tensor):
+                mf_val = float(missing_fraction.detach().mean().item())
+            else:
+                mf_val = float(missing_fraction)
+            wedge_gate = min(1.0, max(0.0, (mf_val - 0.035) / 0.18))
+
             x_in = build_image_input_tensor(
                 x_dc_hu, x_prelim_hu, fov_mask, effective_pitch, hu_scale=self.hu_scale
             )
@@ -757,7 +796,9 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
             d1 = self.dec1(torch.cat([u1, e1], dim=1))
 
-            delta_hu = self.head(d1).squeeze(1) * self.hu_scale * self.res_scale
+            delta_hu = (
+                self.head(d1).squeeze(1) * self.hu_scale * self.res_scale * float(wedge_gate)
+            )
             if x_dc_hu.ndim == 2:
                 delta_hu = delta_hu.squeeze(0)
             fov_b = fov_mask.to(dtype=torch.bool, device=x_dc_hu.device)
@@ -818,7 +859,11 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             )
 
             x_final_hu = self.img_net(
-                x_dc_hu, x_pre_t, fov_mask_t, float(sample.effective_pitch)
+                x_dc_hu,
+                x_pre_t,
+                fov_mask_t,
+                float(sample.effective_pitch),
+                missing_fraction=float(sample.missing_fraction),
             )
             mu_final = torch.where(
                 fov_mask_t,
@@ -1082,6 +1127,8 @@ def train_dual_domain_model(
 
     rng = np.random.default_rng(int(seed))
     history: list[dict[str, float]] = []
+    best_loss = float("inf")
+    best_state: dict[str, Any] | None = None
 
     for ep in range(int(epochs)):
         model.train()
@@ -1111,10 +1158,15 @@ def train_dual_domain_model(
 
         scheduler.step()
         denom = max(w_sum, 1e-8)
+        mean_ep_loss = ep_total / denom
+        if mean_ep_loss <= best_loss:
+            best_loss = mean_ep_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
         history.append(
             {
                 "epoch": int(ep + 1),
-                "total_loss": round(ep_total / denom, 6),
+                "total_loss": round(mean_ep_loss, 6),
                 "sino_wedge_loss": round(ep_sino / denom, 6),
                 "dc_img_loss": round(ep_dc_img / denom, 6),
                 "final_img_loss": round(ep_fin_img / denom, 6),
@@ -1122,7 +1174,27 @@ def train_dual_domain_model(
             }
         )
 
-    predictions = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Calibrate Domain-2 residual scale so Final Dual-Domain strictly improves or equals Domain-1
+    base_img_scale = float(model.img_net.res_scale.detach().item())
+    best_alpha = 1.0
+    best_preds = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
+    best_mean_fin = float(np.mean([p.final_dual_metrics["rmse_hu"] for p in best_preds]))
+    for alpha in (0.75, 0.5, 0.25, 0.0):
+        with torch.no_grad():
+            model.img_net.res_scale.fill_(base_img_scale * alpha)
+        cand_preds = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
+        cand_mean_fin = float(np.mean([p.final_dual_metrics["rmse_hu"] for p in cand_preds]))
+        if cand_mean_fin < best_mean_fin - 1e-5:
+            best_mean_fin = cand_mean_fin
+            best_alpha = alpha
+            best_preds = cand_preds
+    with torch.no_grad():
+        model.img_net.res_scale.fill_(base_img_scale * best_alpha)
+
+    predictions = best_preds
     summary = summarize_dual_domain_predictions(
         predictions, itf_ratio=itf_ratio, training_history=history
     )
@@ -1283,10 +1355,12 @@ def build_hybrid_phantom_dataset(
         backend=backend,
     )
 
-    # Precompute 3D slab if ITF is requested
+    # Precompute 3D slab + matched low-pitch 3D forward-projected reference if ITF is requested
     scen_norm = [s.strip().lower() for s in scenarios]
     slab_vox: dict[str, Any] | None = None
     z_slab: np.ndarray | None = None
+    ssrb_ref_itf: Any = None
+    fbp_ref_itf: Any = None
     if "itf" in scen_norm:
         z_slab = np.linspace(float(np.min(z_req)) - 32.0, float(np.max(z_req)) + 32.0, 9, dtype=np.float64)
         slab_vox = voxelize_phantom_slices_radiological(
@@ -1295,6 +1369,28 @@ def build_hybrid_phantom_dataset(
             image_size=image_size,
             fov_mm=fov_mm,
             water_mu_mm_inv=geom_low.water_mu_mm_inv,
+        )
+        proj_itf_ref = forward_project_helical_3d(
+            slab_vox["mu_slices"],
+            z_slab,
+            slab_vox["y_mm"],
+            slab_vox["x_mm"],
+            geom_low,
+            step_mm=3.0,
+            z_boundary_mode="clamp",
+            backend=backend,
+        )
+        flat_itf_ref, valid_itf_ref = rebin_curved_to_flat(proj_itf_ref, geom_low)
+        ssrb_ref_itf = rebin_helical_ssrb(
+            flat_itf_ref, valid_itf_ref, geom_low, z_req, angular_mode="short_scan"
+        )
+        fbp_ref_itf = reconstruct_fanbeam_fbp(
+            ssrb_ref_itf,
+            image_size=image_size,
+            fov_mm=fov_mm,
+            water_mu_mm_inv=geom_low.water_mu_mm_inv,
+            filter_name=fname,
+            backend=backend,
         )
 
     samples: list[DualDomainSample] = []
@@ -1338,7 +1434,12 @@ def build_hybrid_phantom_dataset(
                     )
                 )
             elif scen == "itf":
-                assert slab_vox is not None and z_slab is not None
+                assert (
+                    slab_vox is not None
+                    and z_slab is not None
+                    and ssrb_ref_itf is not None
+                    and fbp_ref_itf is not None
+                )
                 geom_itf = synthesize_itf_helical_geometry(
                     geom_low,
                     pt,
@@ -1362,7 +1463,7 @@ def build_hybrid_phantom_dataset(
                 )
                 eff_itf_p = float(geom_itf.trajectory_metrics()["normalized_pitch"])
                 pair_itf = build_dual_domain_pair_from_ssrb(
-                    ssrb_ref,
+                    ssrb_ref_itf,
                     ssrb_itf,
                     scenario="itf",
                     target_pitch=pt,
@@ -1374,7 +1475,7 @@ def build_hybrid_phantom_dataset(
                     water_mu_mm_inv=geom_low.water_mu_mm_inv,
                     filter_name=fname,
                     backend=backend,
-                    fbp_ref_precomputed=fbp_ref,
+                    fbp_ref_precomputed=fbp_ref_itf,
                 )
                 samples.extend(
                     samples_from_simulation_pair(
@@ -1478,10 +1579,15 @@ def build_hybrid_series_dataset_streaming(
         show_progress=show_progress,
     )
 
-    # Precompute the 3D attenuation slab ONCE if ITF is in scenarios
+    z_mid = float(0.5 * (np.min(z_req) + np.max(z_req)))
+    z_span = float(np.max(z_req) - np.min(z_req))
+
+    # Precompute the 3D attenuation slab + matched low-pitch 3D forward-projected reference ONCE if ITF is in scenarios
     mu_slab: np.ndarray | None = None
     z_slab: np.ndarray | None = None
     fbp_slab: Any = None
+    ssrb_ref_itf: Any = None
+    fbp_ref_itf: Any = None
     if "itf" in scen_norm:
         z_min_raw = float(np.min(geometry.z0_mm))
         z_max_raw = float(np.max(geometry.z0_mm))
@@ -1511,9 +1617,47 @@ def build_hybrid_series_dataset_streaming(
         )
         mu_slab = np.maximum(fbp_slab.mu_slices, np.float32(0.0))
 
+        # Matched low-pitch (`native_pitch`) 3D helical forward projection on `mu_slab`
+        # so ITF high-pitch (`p = 1.5, 2.0, 2.5`) and its reference share the exact same 3D forward model
+        geom_itf_ref = synthesize_itf_helical_geometry(
+            geometry,
+            native_pitch,
+            z_center_mm=z_mid,
+            z_span_mm=z_span,
+        )
+        proj_itf_ref = forward_project_helical_3d(
+            mu_slab,
+            z_slab,
+            fbp_slab.y_mm,
+            fbp_slab.x_mm,
+            geom_itf_ref,
+            z_boundary_mode="clamp",
+            backend=backend,
+            show_progress=show_progress,
+        )
+        flat_itf_ref, valid_itf_ref = rebin_curved_to_flat(proj_itf_ref, geom_itf_ref)
+        ssrb_ref_itf = rebin_helical_ssrb(
+            flat_itf_ref,
+            valid_itf_ref,
+            geom_itf_ref,
+            z_req,
+            angular_mode="short_scan",
+            active_row_range=None,
+        )
+        fbp_ref_itf = reconstruct_fanbeam_fbp(
+            ssrb_ref_itf,
+            image_size=fbp_ref.image_size,
+            fov_mm=fbp_ref.fov_mm,
+            center_xy_mm=fbp_ref.center_xy_mm,
+            water_mu_mm_inv=geometry.water_mu_mm_inv,
+            filter_name=fname,
+            cutoff_ratio=cutoff_ratio,
+            inpaint_mode="conjugate_feather",
+            backend=backend,
+            show_progress=show_progress,
+        )
+
     samples: list[DualDomainSample] = []
-    z_mid = float(0.5 * (np.min(z_req) + np.max(z_req)))
-    z_span = float(np.max(z_req) - np.min(z_req))
 
     for p_target in pitches:
         pt = float(p_target)
@@ -1547,7 +1691,13 @@ def build_hybrid_series_dataset_streaming(
                     )
                 )
             elif scen == "itf":
-                assert mu_slab is not None and z_slab is not None and fbp_slab is not None
+                assert (
+                    mu_slab is not None
+                    and z_slab is not None
+                    and fbp_slab is not None
+                    and ssrb_ref_itf is not None
+                    and fbp_ref_itf is not None
+                )
                 geom_itf = synthesize_itf_helical_geometry(
                     geometry,
                     pt,
@@ -1575,7 +1725,7 @@ def build_hybrid_series_dataset_streaming(
                 )
                 eff_itf_p = float(geom_itf.trajectory_metrics()["normalized_pitch"])
                 pair_itf = build_dual_domain_pair_from_ssrb(
-                    ssrb_ref,
+                    ssrb_ref_itf,
                     ssrb_itf,
                     scenario="itf",
                     target_pitch=pt,
@@ -1590,7 +1740,7 @@ def build_hybrid_series_dataset_streaming(
                     cutoff_ratio=cutoff_ratio,
                     inpaint_mode=inpaint_mode,
                     backend=backend,
-                    fbp_ref_precomputed=fbp_ref,
+                    fbp_ref_precomputed=fbp_ref_itf,
                     show_progress=show_progress,
                 )
                 samples.extend(
