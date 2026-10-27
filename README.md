@@ -164,7 +164,7 @@ print("Selected explicit backends -> sim:", sim_backend, "| dl:", dl_backend)
 
 !hpct download --series-file configs/pilot_c012.csv --workers 4 --retries 5
 !hpct stage4-sim --case-id C012 --scenario both --target-pitch 2.0 --pitches 1.5,2.0,2.5 --num-slices 1 --n-xy 256 --itf-slab-slices 11 --filter-name ram_lak --backend {sim_backend} --run-phantom-check --save-pairs-npz --workers 4
-!hpct stage5-train --case-id C012 --pitches 1.5,2.0,2.5 --itf-ratio 0.60 --num-slices 1 --image-size 256 --itf-slab-slices 9 --epochs 15 --lr 0.0025 --filter-name ram_lak --backend {dl_backend} --sim-backend {sim_backend} --run-phantom-check --save-dataset-npz --save-model-pt --workers 4
+!hpct stage5-train --case-id C012 --scenario both --pitches 1.5,2.0,2.5 --itf-ratio 0.60 --num-slices 1 --image-size 256 --itf-slab-slices 7 --epochs 12 --lr 0.0025 --filter-name ram_lak --backend {dl_backend} --run-phantom-check --save-dataset-npz --save-model --workers 4
 ```
 
 ---

@@ -50,7 +50,7 @@
 ### أ) الفحص الذاتي الكامل على الفانتوم (`Synthetic Phantom Check`)
 ```bash
 hpct stage5-train \
-  --output-root /kaggle/working/highpitchct-data \
+  --data-root /kaggle/working/highpitchct-data \
   --run-phantom-check \
   --pitches "1.5,2.0,2.5" \
   --itf-ratio 0.60 \
@@ -61,19 +61,21 @@ hpct stage5-train \
 ### ب) التدريب والتقييم الهجين (`60% ITF + 40% RDC`) على بيانات مريض حقيقي (`DICOM-CT-PD`)
 ```bash
 hpct stage5-train \
-  --output-root /kaggle/working/highpitchct-data \
-  --series-dir "/kaggle/input/.../C012/..." \
-  --case-id case_C012 \
+  --data-root /kaggle/working/highpitchct-data \
+  --case-id C012 \
+  --scenario both \
   --pitches "1.5,2.0,2.5" \
   --itf-ratio 0.60 \
   --fov-mm 400.0 \
   --image-size 256 \
-  --epochs 15 \
+  --epochs 12 \
   --filter-name ram_lak \
-  --backend torch
+  --backend torch \
+  --save-model \
+  --save-dataset-npz
 ```
 
 تُحفظ لوحة المقارنة البصرية السداسية في:
 `manifests/figures/stage5_<case_id>_dl_visual_qa.png`
 وتقرير المقاييس الكمية في:
-`manifests/stage5_dual_domain_dl_report.json`
+`manifests/stage5_dl_report.json`
