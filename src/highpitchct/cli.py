@@ -2994,7 +2994,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 6 (v0.9.4)",
+            "stage": "Stage 6 (v0.9.5)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "real_patient_generalization": real_generalization,
@@ -3002,9 +3002,21 @@ def main(argv: list[str] | None = None) -> int:
         }
         out_json = env_prof.data_root / "manifests" / "stage6_generalization_report.json"
         out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
         report["report_json"] = str(out_json)
-        print(json.dumps(report, indent=2))
+        out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(
+            f"[Stage 6] Saved full report -> {out_json} | overall_pass={all_pass}",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Keep stdout compact (< 32 KiB) so sequential stderr->stdout Popen callers never hit OS 64 KiB pipe deadlock
+        stdout_report = json.loads(json.dumps(report))
+        if stdout_report.get("real_patient_generalization"):
+            ts = stdout_report["real_patient_generalization"].get("train_summary")
+            if isinstance(ts, dict):
+                ts.pop("per_sample", None)
+                ts.pop("training_history", None)
+        print(json.dumps(stdout_report, separators=(",", ":")), flush=True)
         return 0 if all_pass else 1
 
     # download command

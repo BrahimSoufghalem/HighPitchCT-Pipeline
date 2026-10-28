@@ -1703,21 +1703,49 @@ def train_dual_domain_model(
         with torch.no_grad():
             model.sino_net.res_scale.fill_(base_sino_scale * best_sino_alpha)
 
-    # Calibrate Domain-2 residual scale on training samples so Final Dual-Domain strictly improves or equals Domain-1
+    # Calibrate Domain-2 residual scale on training samples using cached Domain-1 x_dc_hu (fast: skips SinoNet+FBP)
     base_img_scale = float(model.img_net.res_scale.detach().item())
     best_alpha = 1.0
     best_mean_fin = float(np.mean([p.final_dual_metrics["rmse_hu"] for p in best_preds]))
+    img_dev = next(model.img_net.parameters()).device
     for alpha in (0.75, 0.5, 0.25, 0.0):
+        cand_rmses: list[float] = []
         with torch.no_grad():
             model.img_net.res_scale.fill_(base_img_scale * alpha)
-        cand_preds = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
-        cand_mean_fin = float(np.mean([p.final_dual_metrics["rmse_hu"] for p in cand_preds]))
+            for p in best_preds:
+                s = p.sample
+                x_dc_t = torch.as_tensor(p.x_dc_hu, dtype=torch.float32, device=img_dev)
+                x_pre_t = torch.as_tensor(s.x_prelim_hu, dtype=torch.float32, device=img_dev)
+                fov_t = torch.as_tensor(s.fov_mask, dtype=torch.bool, device=img_dev)
+                x_cand = (
+                    model.img_net(
+                        x_dc_t,
+                        x_pre_t,
+                        fov_t,
+                        float(s.effective_pitch),
+                        missing_fraction=float(s.missing_fraction),
+                    )
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
+                diff = (x_cand[s.fov_mask] - s.x_target_hu[s.fov_mask]).astype(np.float64)
+                cand_rmses.append(float(np.sqrt(np.mean(diff * diff))))
+        cand_mean_fin = float(np.mean(cand_rmses))
         if cand_mean_fin < best_mean_fin - 1e-5:
             best_mean_fin = cand_mean_fin
             best_alpha = alpha
-            best_preds = cand_preds
     with torch.no_grad():
         model.img_net.res_scale.fill_(base_img_scale * best_alpha)
+    if best_alpha != 1.0:
+        best_preds = [evaluate_dual_domain_sample(model, s, device=device) for s in samples]
+
+    print(
+        f"[Eval] Training evaluation complete (mean Final RMSE={best_mean_fin:.2f} HU, img_alpha={best_alpha}).",
+        file=sys.stderr,
+        flush=True,
+    )
 
     predictions = best_preds
     summary = summarize_dual_domain_predictions(
