@@ -1329,6 +1329,8 @@ def train_dual_domain_model(
          `DifferentiableParkerFBPBridge` (`ram_lak`) with
          `L_joint = 1.0 * L_img(x_final, x*) + 0.02 * L1(s_dc, s*) + 0.01 * L_grad(s_dc, s*) + 0.35 * L_dc_img`.
     """
+    import sys
+    import time
     import torch
 
     if not samples:
@@ -1353,10 +1355,20 @@ def train_dual_domain_model(
         img_pretrain_epochs=img_pretrain_epochs,
         joint_finetune_epochs=joint_finetune_epochs,
     )
+    total_ep = n_sino + n_img + n_joint
     curriculum = build_weighted_hybrid_curriculum(samples, itf_ratio=itf_ratio)
     rng = np.random.default_rng(int(seed))
     history: list[dict[str, Any]] = []
     epoch_counter = 0
+
+    print(
+        f"[Train] Devices: Domain-1(SinoNet+FBP)={device_info['domain1_sino_fbp_device']} | "
+        f"Domain-2(ImgNet)={device_info['domain2_img_device']} | "
+        f"multi_gpu={device_info['multi_gpu_domain_parallel']} | "
+        f"samples={len(curriculum)} | epochs=({n_sino}, {n_img}, {n_joint})",
+        file=sys.stderr,
+        flush=True,
+    )
 
     # -------------------------------------------------------------------------
     # STAGE 1: Sinogram U-Net Pretraining (Poster Eq. 1)
@@ -1374,7 +1386,8 @@ def train_dual_domain_model(
         best_sino_loss = float("inf")
         best_sino_state: dict[str, Any] | None = None
 
-        for _ in range(n_sino):
+        for s_ep in range(1, n_sino + 1):
+            t_ep0 = time.perf_counter()
             epoch_counter += 1
             model.sino_net.train()
             model.img_net.eval()
@@ -1418,6 +1431,15 @@ def train_dual_domain_model(
                 best_sino_state = {
                     k: v.detach().cpu().clone() for k, v in model.sino_net.state_dict().items()
                 }
+            cur_lr = float(sched_sino.get_last_lr()[0])
+            dt_ep = time.perf_counter() - t_ep0
+            print(
+                f"[Epoch {epoch_counter:02d}/{total_ep:02d} | Stage 1/3 SinoNet {s_ep:02d}/{n_sino:02d}] "
+                f"sino_obj={mean_phase_loss:.5f} | wedge={ep_sino/denom:.5f} | "
+                f"dc_img={ep_dc_img/denom:.5f} | lr={cur_lr:.6f} ({dt_ep:.1f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
             history.append(
                 {
                     "epoch": int(epoch_counter),
@@ -1427,7 +1449,7 @@ def train_dual_domain_model(
                     "sino_wedge_loss": round(ep_sino / denom, 6),
                     "dc_img_loss": round(ep_dc_img / denom, 6),
                     "final_img_loss": round(ep_fin_img / denom, 6),
-                    "lr": round(float(sched_sino.get_last_lr()[0]), 7),
+                    "lr": round(cur_lr, 7),
                 }
             )
 
@@ -1449,6 +1471,11 @@ def train_dual_domain_model(
             p.requires_grad_(True)
 
         # Cache fixed Domain-1 outputs on CPU so Stage 2 uses 0 MB of persistent GPU cache
+        print(
+            f"[Stage 2/3] Caching frozen Domain-1 (SinoNet+FBP) outputs on CPU for {len(curriculum)} samples...",
+            file=sys.stderr,
+            flush=True,
+        )
         model.sino_net.eval()
         cached_d1: list[dict[str, Any]] = []
         with torch.no_grad():
@@ -1475,7 +1502,8 @@ def train_dual_domain_model(
         best_img_state: dict[str, Any] | None = None
         img_dev = next(model.img_net.parameters()).device
 
-        for _ in range(n_img):
+        for i_ep in range(1, n_img + 1):
+            t_ep0 = time.perf_counter()
             epoch_counter += 1
             model.img_net.train()
             order = rng.permutation(len(curriculum))
@@ -1534,6 +1562,15 @@ def train_dual_domain_model(
                 best_img_state = {
                     k: v.detach().cpu().clone() for k, v in model.img_net.state_dict().items()
                 }
+            cur_lr = float(sched_img.get_last_lr()[0])
+            dt_ep = time.perf_counter() - t_ep0
+            print(
+                f"[Epoch {epoch_counter:02d}/{total_ep:02d} | Stage 2/3 ImgNet  {i_ep:02d}/{n_img:02d}] "
+                f"img_obj={mean_phase_loss:.5f} | final_img={ep_fin_img/denom:.5f} | "
+                f"lr={cur_lr:.6f} ({dt_ep:.1f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
             history.append(
                 {
                     "epoch": int(epoch_counter),
@@ -1543,7 +1580,7 @@ def train_dual_domain_model(
                     "sino_wedge_loss": round(ep_sino / denom, 6),
                     "dc_img_loss": round(ep_dc_img / denom, 6),
                     "final_img_loss": round(ep_fin_img / denom, 6),
-                    "lr": round(float(sched_img.get_last_lr()[0]), 7),
+                    "lr": round(cur_lr, 7),
                 }
             )
 
@@ -1570,7 +1607,8 @@ def train_dual_domain_model(
         best_joint_loss = float("inf")
         best_joint_state: dict[str, Any] | None = None
 
-        for _ in range(n_joint):
+        for j_ep in range(1, n_joint + 1):
+            t_ep0 = time.perf_counter()
             epoch_counter += 1
             model.train()
             order = rng.permutation(len(curriculum))
@@ -1609,6 +1647,15 @@ def train_dual_domain_model(
                 best_joint_state = {
                     k: v.detach().cpu().clone() for k, v in model.state_dict().items()
                 }
+            cur_lr = float(sched_joint.get_last_lr()[0])
+            dt_ep = time.perf_counter() - t_ep0
+            print(
+                f"[Epoch {epoch_counter:02d}/{total_ep:02d} | Stage 3/3 Joint   {j_ep:02d}/{n_joint:02d}] "
+                f"joint_obj={mean_phase_loss:.5f} | total={mean_ep_loss:.5f} | "
+                f"final_img={ep_fin_img/denom:.5f} | lr={cur_lr:.6f} ({dt_ep:.1f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
 
             history.append(
                 {
@@ -1619,7 +1666,7 @@ def train_dual_domain_model(
                     "sino_wedge_loss": round(ep_sino / denom, 6),
                     "dc_img_loss": round(ep_dc_img / denom, 6),
                     "final_img_loss": round(ep_fin_img / denom, 6),
-                    "lr": round(float(sched_joint.get_last_lr()[0]), 7),
+                    "lr": round(cur_lr, 7),
                 }
             )
 
@@ -1630,6 +1677,12 @@ def train_dual_domain_model(
         del opt_joint, sched_joint, best_joint_state
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+    print(
+        f"[Eval] Calibrating residual scales and evaluating on {len(samples)} training samples...",
+        file=sys.stderr,
+        flush=True,
+    )
 
     # Safeguard Domain-1 residual scale on training samples if needed
     base_sino_scale = float(model.sino_net.res_scale.detach().item())

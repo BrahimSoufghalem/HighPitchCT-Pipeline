@@ -600,8 +600,15 @@ def build_real_series_generalization_split(
         }
 
     # active_mode == "axial_guardband"
+    import sys
+
     slab_half_used = 18.0
     for cid, pdir, idir in targets:
+        print(
+            f"[Stage 6] Scanning DICOM projection series for {cid} ({pdir})...",
+            file=sys.stderr,
+            flush=True,
+        )
         geom, files = scan_projection_series(
             pdir, workers=max(workers, 4), show_progress=show_progress
         )
@@ -620,6 +627,12 @@ def build_real_series_generalization_split(
         z_train_arr = np.asarray(plan["train_z_slices_mm"], dtype=np.float64)
         z_test_arr = np.asarray(plan["test_z_slices_mm"], dtype=np.float64)
 
+        print(
+            f"[Stage 6] Building TRAIN split for {cid}: slices z={plan['train_z_slices_mm']} mm "
+            f"(pitches={list(pitches)}, scenarios={list(scenarios)})...",
+            file=sys.stderr,
+            flush=True,
+        )
         tr_s = build_hybrid_series_dataset_streaming(
             files,
             z_train_arr,
@@ -638,6 +651,12 @@ def build_real_series_generalization_split(
             backend=backend,
             workers=workers,
             show_progress=show_progress,
+        )
+        print(
+            f"[Stage 6] Building UNSEEN TEST split for {cid}: slices z={plan['test_z_slices_mm']} mm "
+            f"(guardband={plan['actual_guardband_mm']} mm, 3D ITF slab gap={plan['itf_slab_gap_mm']} mm)...",
+            file=sys.stderr,
+            flush=True,
         )
         te_s = build_hybrid_series_dataset_streaming(
             files,
@@ -685,6 +704,12 @@ def build_real_series_generalization_split(
         min_guardband_mm=float(min_guardband_mm),
         itf_slab_half_span_mm=slab_half_used,
     )
+    print(
+        f"[Stage 6] Zero-Leakage Audit PASSED: {len(train_samples)} train samples vs "
+        f"{len(test_samples)} unseen test samples.",
+        file=sys.stderr,
+        flush=True,
+    )
     return {
         "split_mode": "axial_guardband",
         "train_samples": train_samples,
@@ -723,6 +748,8 @@ def run_generalization_experiment(
        adaptation.
     4. Returns both training and held-out test summaries, predictions, and generalization gap metrics.
     """
+    import sys
+
     audit = verify_zero_leakage_split(
         train_samples,
         test_samples,
@@ -756,6 +783,11 @@ def run_generalization_experiment(
     train_preds: list[DualDomainPrediction] = train_res["predictions"]
     train_summary = train_res["summary"]
 
+    print(
+        f"[Stage 6] Running frozen Zero-Shot evaluation on {len(test_samples)} UNSEEN test samples...",
+        file=sys.stderr,
+        flush=True,
+    )
     # Frozen zero-shot out-of-sample evaluation on held-out test_samples
     test_preds: list[DualDomainPrediction] = [
         evaluate_dual_domain_sample(model, s, device=device) for s in test_samples
