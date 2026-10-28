@@ -2333,7 +2333,7 @@ def load_dual_domain_checkpoint(
 ) -> tuple[Any, Any, dict[str, Any]]:
     """Load `DualDomainHighPitchNet` from a `.pt` checkpoint onto the requested backend."""
     torch, device = resolve_torch_device(backend)
-    payload = torch.load(Path(ckpt_path), map_location=device, weights_only=False)
+    payload = torch.load(Path(ckpt_path), map_location="cpu", weights_only=False)
     cfg = payload.get("config", {})
     model, _ = create_dual_domain_model(
         sino_base_channels=int(cfg.get("sino_base_channels", 64)),
@@ -2344,6 +2344,8 @@ def load_dual_domain_checkpoint(
         backend=backend,
     )
     model.load_state_dict(payload["model_state_dict"])
+    if hasattr(model, "configure_devices"):
+        model.configure_devices(device)
     model.eval()
     return model, device, payload
 

@@ -280,7 +280,53 @@ class TestStage6Generalization(unittest.TestCase):
                 ["case_C027"],
             )
             self.assertTrue(Path(real_gen["visual_qa_png"]).exists())
-            self.assertTrue(Path(real_gen["model_checkpoint_pt"]).exists())
+            ckpt_pt = Path(real_gen["model_checkpoint_pt"])
+            self.assertTrue(ckpt_pt.exists())
+            self.assertIn(
+                "unseen_test_domain2_vs_domain1_rmse_delta_hu",
+                real_gen["generalization_metrics"],
+            )
+
+            # Verify frozen zero-shot evaluation via --load-model without retraining
+            rc_eval = main(
+                [
+                    "stage6-generalize",
+                    "--data-root",
+                    str(root),
+                    "--split-mode",
+                    "patient_split",
+                    "--train-cases",
+                    "C012",
+                    "--test-cases",
+                    "C027",
+                    "--train-slices-per-case",
+                    "1",
+                    "--test-slices-per-case",
+                    "1",
+                    "--pitches",
+                    "1.5,2.0,2.5",
+                    "--itf-ratio",
+                    "0.60",
+                    "--image-size",
+                    "64",
+                    "--fov-mm",
+                    "360.0",
+                    "--load-model",
+                    str(ckpt_pt),
+                    "--backend",
+                    "torch",
+                    "--no-progress",
+                ]
+            )
+            self.assertEqual(rc_eval, 0)
+            rep_eval = json.loads(rep_path.read_text(encoding="utf-8"))
+            self.assertAlmostEqual(
+                rep_eval["real_patient_generalization"]["generalization_metrics"][
+                    "unseen_test_final_dual_rmse_hu"
+                ],
+                real_gen["generalization_metrics"]["unseen_test_final_dual_rmse_hu"],
+                places=4,
+            )
 
 
 if __name__ == "__main__":

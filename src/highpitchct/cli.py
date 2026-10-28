@@ -1638,6 +1638,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Save generalized DualDomainHighPitchNet weights to <data-root>/manifests/stage6_generalized_dual_domain.pt",
     )
     stage6.add_argument(
+        "--load-model",
+        default=None,
+        help="Optional path to a saved .pt DualDomainHighPitchNet checkpoint for frozen zero-shot evaluation without retraining",
+    )
+    stage6.add_argument(
         "--run-phantom-check",
         action="store_true",
         help="Run Stage 6 synthetic multi-phantom zero-leakage generalization check",
@@ -2903,6 +2908,7 @@ def main(argv: list[str] | None = None) -> int:
                 itf_ratio=float(args.itf_ratio),
                 backend=args.backend,
                 seed=42,
+                load_checkpoint_path=getattr(args, "load_model", None),
             )
 
             test_preds = exp_res["unseen_test_predictions"]
@@ -2988,7 +2994,7 @@ def main(argv: list[str] | None = None) -> int:
                 all_pass = False
 
         report = {
-            "stage": "Stage 6 (v0.9.0)",
+            "stage": "Stage 6 (v0.9.4)",
             "overall_pass": all_pass,
             "elapsed_seconds": round(time.monotonic() - t_start, 3),
             "real_patient_generalization": real_generalization,
