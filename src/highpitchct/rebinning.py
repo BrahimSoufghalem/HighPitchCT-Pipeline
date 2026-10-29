@@ -286,12 +286,19 @@ def rebin_curved_to_flat(
     *,
     plan: CurvedToFlatPlan | None = None,
     batch_views: int = 128,
+    backend: str = "numpy",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Vectorized 3D Curved-to-Flat rebinning returning (flat_projections, valid_flat_mask).
 
     Out-of-bounds pixels are strictly set to `0.0` with `valid_flat_mask = False`
     (never smeared via `mode='nearest'`).
     """
+    backend_norm = backend.strip().lower()
+    if backend_norm not in {"numpy", "torch", "torch_cuda"}:
+        raise ValueError(
+            f"Unsupported backend={backend!r}; expected 'numpy', 'torch', or 'torch_cuda'"
+        )
+
     proj_arr = np.asarray(projections, dtype=np.float32)
     expected_shape = (geometry.n_views, geometry.n_rows, geometry.n_cols)
     if proj_arr.shape != expected_shape:
@@ -308,6 +315,66 @@ def rebin_curved_to_flat(
     valid_out = active_plan.valid_mask_states[active_plan.view_state_inverse].copy()
 
     n_states = int(active_plan.unique_ffs_states.shape[0])
+    if backend_norm in {"torch", "torch_cuda"}:
+        try:
+            import torch
+        except ImportError as error:
+            raise RuntimeError(
+                "PyTorch is required when backend is 'torch' or 'torch_cuda' (no silent fallback)."
+            ) from error
+        if backend_norm == "torch_cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "backend='torch_cuda' requested in rebin_curved_to_flat, "
+                "but torch.cuda.is_available() is False (no silent fallback)."
+            )
+        device = torch.device("cuda" if backend_norm == "torch_cuda" else "cpu")
+        step_gpu = max(256, int(batch_views))
+        n_cols_in = int(geometry.n_cols)
+        with torch.no_grad():
+            for s in range(n_states):
+                view_idx = np.where(active_plan.view_state_inverse == s)[0]
+                if view_idx.size == 0:
+                    continue
+                lin00 = torch.as_tensor(
+                    (active_plan.r0_states[s] * n_cols_in + active_plan.c0_states[s]).reshape(-1),
+                    dtype=torch.long,
+                    device=device,
+                )
+                lin01 = torch.as_tensor(
+                    (active_plan.r0_states[s] * n_cols_in + active_plan.c1_states[s]).reshape(-1),
+                    dtype=torch.long,
+                    device=device,
+                )
+                lin10 = torch.as_tensor(
+                    (active_plan.r1_states[s] * n_cols_in + active_plan.c0_states[s]).reshape(-1),
+                    dtype=torch.long,
+                    device=device,
+                )
+                lin11 = torch.as_tensor(
+                    (active_plan.r1_states[s] * n_cols_in + active_plan.c1_states[s]).reshape(-1),
+                    dtype=torch.long,
+                    device=device,
+                )
+                w00_t = torch.as_tensor(active_plan.w00_states[s].reshape(1, -1), device=device)
+                w01_t = torch.as_tensor(active_plan.w01_states[s].reshape(1, -1), device=device)
+                w10_t = torch.as_tensor(active_plan.w10_states[s].reshape(1, -1), device=device)
+                w11_t = torch.as_tensor(active_plan.w11_states[s].reshape(1, -1), device=device)
+                for start in range(0, view_idx.size, step_gpu):
+                    sub_idx = view_idx[start : start + step_gpu]
+                    src_t = torch.as_tensor(
+                        np.ascontiguousarray(proj_arr[sub_idx]),
+                        dtype=torch.float32,
+                        device=device,
+                    ).reshape(sub_idx.size, -1)
+                    out_t = (
+                        src_t[:, lin00] * w00_t
+                        + src_t[:, lin01] * w01_t
+                        + src_t[:, lin10] * w10_t
+                        + src_t[:, lin11] * w11_t
+                    ).reshape(sub_idx.size, active_plan.n_v, active_plan.n_u)
+                    flat_out[sub_idx] = out_t.detach().cpu().numpy()
+        return flat_out, valid_out
+
     step = max(1, int(batch_views))
     for s in range(n_states):
         view_idx = np.where(active_plan.view_state_inverse == s)[0]
@@ -583,6 +650,7 @@ def rebin_helical_ssrb(
     active_row_range: tuple[float, float] | None = None,
     apply_cosine_weight: bool = True,
     phi_center_override: np.ndarray | None = None,
+    workers: int = 1,
 ) -> SSRBResult:
     """Vectorized Noo et al. (1999) Helical Single-Slice Rebinning with full 3D FFS support.
 
@@ -719,7 +787,7 @@ def rebin_helical_ssrb(
     v_max_abs = max(abs((r_flat_0 - r_min_act) * dv_eff), abs((r_flat_0 - r_max_act) * dv_eff))
     z_reach_max = v_max_abs * (float(np.max(rho_s_all)) / float(geometry.d0_mm)) + 5.0
 
-    for s_idx in range(n_slices):
+    def _rebin_slice_at(s_idx: int) -> None:
         z_sl = float(z_arr[s_idx])
         beta_s = beta_rad[s_idx]  # (nb_out,)
         best_abs_v = np.full((nb_out, n_u), np.inf, dtype=np.float64)
@@ -752,7 +820,6 @@ def rebin_helical_ssrb(
                 mid_pos = float(np.interp(mid_phi, phi_sorted, gc["pos_sorted"]))
                 z_est = float(z_g[min(int(round(mid_pos)), z_g.size - 1)])
                 if abs(z_sl - z_est) > z_reach_max + abs(float(z_g[-1] - z_g[0])) * 0.25 and z_g.size > 64:
-                    # Check exact min |z_sl - z_s| on endpoints of cand_ok
                     p_lo = float(np.interp(float(np.min(phi_star[cand_ok])), phi_sorted, gc["pos_sorted"]))
                     p_hi = float(np.interp(float(np.max(phi_star[cand_ok])), phi_sorted, gc["pos_sorted"]))
                     z_lo = float(z_g[int(math.floor(p_lo))])
@@ -861,6 +928,16 @@ def rebin_helical_ssrb(
 
         sinograms[s_idx] = best_val
         measured[s_idx] = best_mask
+
+    eff_workers = max(1, min(int(workers), n_slices))
+    if eff_workers <= 1 or n_slices < 4:
+        for s_idx in range(n_slices):
+            _rebin_slice_at(s_idx)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=eff_workers) as pool:
+            list(pool.map(_rebin_slice_at, range(n_slices)))
 
     return SSRBResult(
         sinograms=sinograms,

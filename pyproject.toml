@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "highpitchct"
-version = "0.9.5"
+version = "1.0.0"
 description = "Stage-gated research pipeline for TCIA CT projection data"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -339,15 +339,21 @@ def build_image_input_tensor(
     hu_offset: float = 500.0,
     hu_scale: float = 1000.0,
     pitch_scale: float = 3.0,
+    in_channels: int = 3,
 ) -> Any:
-    """Construct the 3-channel physics-conditioned input tensor for `ImageRefineUNet`.
+    """Construct the 3- or 4-channel physics-conditioned input tensor for `ImageRefineUNet`.
 
-    Channels `(B, 3, H, W)`:
+    Channels `(B, C, H, W)`:
       0: `(x_dc_hu + hu_offset) / hu_scale` — Intermediate FBP image after `SinoNet + Hard DC`
       1: `(x_prelim_hu + hu_offset) / hu_scale` — Preliminary FBP image (`Fig. 2(c)`)
       2: `fov_mask * (effective_pitch / pitch_scale)` — Spatial FOV & pitch conditioning map
+      3 (when `in_channels == 4`): `clamp((x_dc_hu - x_prelim_hu) / 200.0, -3.0, 3.0) * fov_mask`
+         — Explicit high-pitch streak correction / structural discrepancy guide map.
     """
     import torch
+
+    if int(in_channels) not in {3, 4}:
+        raise ValueError(f"in_channels for ImageRefineUNet must be 3 or 4, got {in_channels}")
 
     if x_dc_hu.ndim == 2:
         x_dc_hu = x_dc_hu.unsqueeze(0)
@@ -375,6 +381,9 @@ def build_image_input_tensor(
     ch0 = ((x_dc_hu + float(hu_offset)) / float(hu_scale)) * fov_f
     ch1 = ((x_prelim_hu + float(hu_offset)) / float(hu_scale)) * fov_f
     ch2 = fov_f * p_t
+    if int(in_channels) == 4:
+        ch3 = torch.clamp((x_dc_hu - x_prelim_hu) / 200.0, min=-3.0, max=3.0) * fov_f
+        return torch.stack([ch0, ch1, ch2, ch3], dim=1)
     return torch.stack([ch0, ch1, ch2], dim=1)
 
 
@@ -386,9 +395,23 @@ def apply_hard_data_consistency(
     """Enforce exact physical measurement consistency: `M * s_hp_raw + (1 - M) * clamp(s_pred, min=0)`."""
     import torch
 
-    mask_f = mask_hp.to(dtype=s_pred.dtype, device=s_pred.device)
-    s_nonneg = torch.clamp(s_pred, min=0.0)
-    return mask_f * s_hp_raw.to(dtype=s_pred.dtype, device=s_pred.device) + (1.0 - mask_f) * s_nonneg
+    s_pred_f32 = s_pred.to(dtype=torch.float32)
+    mask_f = mask_hp.to(dtype=torch.float32, device=s_pred.device)
+    s_nonneg = torch.clamp(s_pred_f32, min=0.0)
+    return mask_f * s_hp_raw.to(dtype=torch.float32, device=s_pred.device) + (1.0 - mask_f) * s_nonneg
+
+
+def _device_has_ample_vram(device: Any, threshold_gib: float = 22.0) -> bool:
+    """Return True if `device` is a CUDA GPU with `>= threshold_gib` total VRAM (e.g., A100 / RTX PRO 6000)."""
+    import torch
+
+    if getattr(device, "type", "cpu") != "cuda" or not torch.cuda.is_available():
+        return False
+    try:
+        total_mem = torch.cuda.get_device_properties(device).total_memory
+        return bool(total_mem >= float(threshold_gib) * (1024.0 ** 3))
+    except Exception:
+        return False
 
 
 def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
@@ -449,7 +472,7 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
           - Decoder: `c4 (512) -> c3 (256) -> c2 (128) -> c1 (64)` via `Bilinear Upsampling + 3x3 Conv`
             with 4 multi-scale skip connections (`concat`)
           - Global Residual (`+`) on `s_reproj` (`Fig. 2(d)`) followed by `HardDataConsistencyLayer`
-            so measured rays (`mask_hp == 1`) remain 100% untouched.
+            so measured rays (`mask_hp == 1`) remain 100% untouched in strict `float32`.
         """
 
         def __init__(self, in_channels: int = 4, base_channels: int = 64) -> None:
@@ -492,6 +515,7 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             nn.init.zeros_(self.head.bias)
             self.res_scale = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
             self.hard_dc = HardDataConsistencyLayer()
+            self.force_checkpointing: bool | None = None
 
         def forward(
             self,
@@ -501,11 +525,15 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             effective_pitch: torch.Tensor | float,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             x_in = build_sino_input_tensor(s_hp_raw, s_reproj, mask_hp, effective_pitch)
-            use_ckpt = (
-                self.training
-                and torch.is_grad_enabled()
-                and (x_in.shape[-2] * x_in.shape[-1] >= 65536)
-            )
+            if self.force_checkpointing is not None:
+                use_ckpt = bool(self.force_checkpointing) and self.training and torch.is_grad_enabled()
+            else:
+                use_ckpt = (
+                    self.training
+                    and torch.is_grad_enabled()
+                    and (x_in.shape[-2] * x_in.shape[-1] >= 65536)
+                    and (not _device_has_ample_vram(x_in.device))
+                )
 
             def _blk(mod: nn.Module, t: torch.Tensor) -> torch.Tensor:
                 if use_ckpt:
@@ -533,19 +561,25 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
             d1 = _blk(self.dec1, torch.cat([u1, e1], dim=1))
 
-            delta_s = self.head(d1).squeeze(1)
-            mask_f = mask_hp.to(dtype=delta_s.dtype, device=delta_s.device)
-            if mask_f.ndim == 4 and delta_s.ndim == 3:
-                mask_f = mask_f.squeeze(1)
-            delta_s_wedge = delta_s * (1.0 - mask_f)
-            s_pred_raw = torch.clamp(s_reproj + self.res_scale * delta_s_wedge, min=0.0)
-            s_dc = self.hard_dc(s_hp_raw, mask_hp, s_pred_raw)
+            delta_s = self.head(d1).squeeze(1).to(dtype=torch.float32)
+            with torch.amp.autocast(device_type=delta_s.device.type, enabled=False):
+                s_reproj_f32 = s_reproj.to(dtype=torch.float32)
+                s_raw_f32 = s_hp_raw.to(dtype=torch.float32)
+                mask_f = mask_hp.to(dtype=torch.float32, device=delta_s.device)
+                if mask_f.ndim == 4 and delta_s.ndim == 3:
+                    mask_f = mask_f.squeeze(1)
+                delta_s_wedge = delta_s * (1.0 - mask_f)
+                s_pred_raw = torch.clamp(
+                    s_reproj_f32 + self.res_scale.to(dtype=torch.float32) * delta_s_wedge,
+                    min=0.0,
+                )
+                s_dc = self.hard_dc(s_raw_f32, mask_hp, s_pred_raw)
             return s_dc, s_pred_raw
 
     class DifferentiableParkerFBPBridge(nn.Module):
         """Differentiable PyTorch Fan-Beam Parker + Ram-Lak FBP Bridge (`s_dc -> x_dc_hu`).
 
-        Performs:
+        Performs (in strict `float32`, immune to AMP `bf16`/`fp16` quantization):
           1. Exact Parker Short-Scan Weighting (or 0.5 full-scan weighting) + Cosine Obliquity Weighting
           2. Raised-cosine lateral truncation roll-off (`lateral_pad_cols`) + zero-padding to `n_fft`
           3. 1D Real FFT multiplication by the finite-aperture calibrated `ram_lak` filter `H(f)`
@@ -567,6 +601,100 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             self.lateral_pad_cols = int(max(0, lateral_pad_cols))
             self._geom_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
             self._active_gpu_slot: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+            self._static_batch_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+        def _get_static_batch_tensors(
+            self,
+            *,
+            n_beta: int,
+            u_coords_mm: np.ndarray,
+            du_mm: float,
+            rho0_mm: float,
+            d0_mm: float,
+            image_size: int,
+            fov_mm: float,
+            device: torch.device,
+        ) -> dict[str, Any]:
+            """Cache slice-invariant detector, FFT ramp kernel, and FOV coordinates (~1 MB total)."""
+            n_u = int(u_coords_mm.size)
+            key = (
+                str(device),
+                int(n_beta),
+                n_u,
+                round(float(du_mm), 6),
+                round(float(rho0_mm), 4),
+                round(float(d0_mm), 4),
+                int(image_size),
+                round(float(fov_mm), 4),
+                self.filter_name,
+                round(self.cutoff_ratio, 4),
+                self.lateral_pad_cols,
+            )
+            cached = self._static_batch_cache.get(key)
+            if cached is not None:
+                return cached
+
+            u64 = np.asarray(u_coords_mm, dtype=np.float64).reshape(-1)
+            alpha64 = np.arctan2(u64, float(d0_mm))
+            cos_w = (float(d0_mm) / np.sqrt(float(d0_mm) ** 2 + u64 * u64)).astype(np.float32)
+
+            pad_u = int(max(0, self.lateral_pad_cols))
+            n_ext = n_u + 2 * pad_u
+            n_fft = max(64, 1 << int(math.ceil(math.log2(max(2, 2 * n_ext)))))
+            du_iso = (float(rho0_mm) / float(d0_mm)) * float(du_mm)
+            h_freq = build_fbp_filter_kernel_rfft(
+                n_fft,
+                du_iso,
+                filter_name=self.filter_name,
+                cutoff_ratio=self.cutoff_ratio,
+            ).astype(np.float32)
+
+            if pad_u > 0:
+                idx_p = np.arange(1, pad_u + 1, dtype=np.float64)
+                left_taper = (0.5 * (1.0 - np.cos(math.pi * idx_p / float(pad_u + 1)))).astype(
+                    np.float32
+                )
+                right_taper = left_taper[::-1].copy()
+            else:
+                left_taper = np.zeros(0, dtype=np.float32)
+                right_taper = np.zeros(0, dtype=np.float32)
+
+            d_xy = float(fov_mm) / float(image_size)
+            half_idx = 0.5 * (image_size - 1.0)
+            x_mm = (half_idx - np.arange(image_size, dtype=np.float64)) * d_xy
+            y_mm = (half_idx - np.arange(image_size, dtype=np.float64)) * d_xy
+            yy, xx = np.meshgrid(y_mm, x_mm, indexing="ij")
+            r_recon = 0.5 * float(fov_mm)
+            gamma_max = float(np.max(np.abs(alpha64)))
+            scanner_fov = default_scanner_fov_mm(float(rho0_mm), gamma_max)
+            r_scan = 0.5 * scanner_fov
+            fov_mask_np = ((xx * xx + yy * yy) <= (r_recon * r_recon)) & (
+                (xx * xx + yy * yy) <= (r_scan * r_scan)
+            )
+            fov_iy, fov_ix = np.where(fov_mask_np)
+            flat_idx = (fov_iy * int(image_size) + fov_ix).astype(np.int64)
+            x_fov = xx[fov_iy, fov_ix].astype(np.float32)
+            y_fov = yy[fov_iy, fov_ix].astype(np.float32)
+
+            entry = {
+                "alpha64": torch.as_tensor(alpha64, dtype=torch.float64, device=device),
+                "gamma_max": gamma_max,
+                "cos_w": torch.as_tensor(cos_w, dtype=torch.float32, device=device),
+                "h_freq": torch.as_tensor(h_freq, dtype=torch.float32, device=device),
+                "left_taper": torch.as_tensor(left_taper, dtype=torch.float32, device=device),
+                "right_taper": torch.as_tensor(right_taper, dtype=torch.float32, device=device),
+                "x_fov": torch.as_tensor(x_fov, dtype=torch.float32, device=device),
+                "y_fov": torch.as_tensor(y_fov, dtype=torch.float32, device=device),
+                "flat_idx": torch.as_tensor(flat_idx, dtype=torch.long, device=device),
+                "fov_mask": torch.as_tensor(fov_mask_np, dtype=torch.bool, device=device),
+                "pad_u": pad_u,
+                "n_fft": n_fft,
+                "image_size": int(image_size),
+            }
+            if len(self._static_batch_cache) >= 16:
+                self._static_batch_cache.pop(next(iter(self._static_batch_cache)))
+            self._static_batch_cache[key] = entry
+            return entry
 
         def _get_cached_geometry_tensors(
             self,
@@ -610,14 +738,12 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
                 else:
                     d_beta = float(beta_1d[-1] - beta_1d[0]) / float(max(n_beta - 1, 1))
 
-                # 1. Parker short-scan (or full-scan) weights * cosine obliquity weight
                 w_parker = compute_parker_weights(
                     beta_1d, u_coords_mm, d0_mm, angular_mode=angular_mode
                 )
                 cos_w = float(d0_mm) / np.sqrt(float(d0_mm) ** 2 + u_coords_mm**2)
-                w_pre = (w_parker * cos_w[None, :]).astype(np.float32)  # (N_beta, N_u)
+                w_pre = (w_parker * cos_w[None, :]).astype(np.float32)
 
-                # 2. Raised-cosine lateral taper + 1D FFT frequency filter H(f)
                 pad_u = int(max(0, self.lateral_pad_cols))
                 n_ext = n_u + 2 * pad_u
                 n_fft = max(64, 1 << int(math.ceil(math.log2(max(2, 2 * n_ext)))))
@@ -639,7 +765,6 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
                     left_taper = np.zeros(0, dtype=np.float32)
                     right_taper = np.zeros(0, dtype=np.float32)
 
-                # 3. Radiological (y_mm, x_mm) coordinate grid and FOV mask matching reconstruct_fanbeam_fbp
                 d_xy = float(fov_mm) / float(image_size)
                 half_idx = 0.5 * (image_size - 1.0)
                 x_mm = (half_idx - np.arange(image_size, dtype=np.float64)) * d_xy
@@ -656,9 +781,8 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
                 x_fov = xx[fov_iy, fov_ix].astype(np.float32)
                 y_fov = yy[fov_iy, fov_ix].astype(np.float32)
 
-                # 4. Precompute active-FOV backprojection gather indices & weights across all angles
-                sin_b = np.sin(beta_1d).astype(np.float32)[:, None]  # (N_beta, 1)
-                cos_b = np.cos(beta_1d).astype(np.float32)[:, None]  # (N_beta, 1)
+                sin_b = np.sin(beta_1d).astype(np.float32)[:, None]
+                cos_b = np.cos(beta_1d).astype(np.float32)[:, None]
                 rho0_f = np.float32(rho0_mm)
                 d0_over_du_f = np.float32(float(d0_mm) / float(du_mm))
                 c_flat_0_f = np.float32(0.5 * (n_u - 1.0))
@@ -699,6 +823,9 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
                     "n_fft": n_fft,
                     "image_size": int(image_size),
                 }
+                # Bounded LRU cap prevents CPU RAM growth over 50,000+ slices
+                if len(self._geom_cache) >= 16:
+                    self._geom_cache.pop(next(iter(self._geom_cache)))
                 self._geom_cache[geom_key] = cpu_entry
 
             if device.type == "cpu":
@@ -726,109 +853,273 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             angular_mode: str = "short_scan",
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """Differentiable FBP reconstruction of a single 2D sinogram `(N_beta, N_u)`."""
-            geom_t = self._get_cached_geometry_tensors(
-                beta_1d=beta_1d,
-                u_coords_mm=u_coords_mm,
-                du_mm=du_mm,
-                rho0_mm=rho0_mm,
-                d0_mm=d0_mm,
-                image_size=image_size,
-                fov_mm=fov_mm,
-                angular_mode=angular_mode,
-                device=sino_2d.device,
-            )
-            n_beta, n_u = sino_2d.shape
-            pad_u = int(geom_t["pad_u"])
-            n_fft = int(geom_t["n_fft"])
-
-            # 1. Pre-weight by Parker * cosine obliquity
-            s_weighted = sino_2d * geom_t["w_pre"]
-
-            # 2. Raised-cosine lateral truncation roll-off + zero-padding to n_fft
-            if pad_u > 0:
-                left_pad = s_weighted[:, 0:1] * geom_t["left_taper"].unsqueeze(0)
-                right_pad = s_weighted[:, -1:] * geom_t["right_taper"].unsqueeze(0)
-                s_ext = torch.cat([left_pad, s_weighted, right_pad], dim=1)
-            else:
-                s_ext = s_weighted
-            s_fft_in = F.pad(s_ext, (0, n_fft - s_ext.shape[1]), mode="constant", value=0.0)
-
-            # 3. 1D Real FFT ramp filtering along detector axis u
-            spec = torch.fft.rfft(s_fft_in, n=n_fft, dim=-1)
-            filtered_full = torch.fft.irfft(spec * geom_t["h_freq"].unsqueeze(0), n=n_fft, dim=-1)
-            q_filtered = filtered_full[:, pad_u : pad_u + n_u]  # (N_beta, N_u)
-
-            # 4. Chunked differentiable fan-beam backprojection onto active FOV pixels
-            n_fov = int(geom_t["fov_iy"].numel())
-            m0_all = geom_t["m0"]
-            w0_all = geom_t["w0"]
-            w1_all = geom_t["w1"]
-            chunk_views = 256
-
-            def _backproject_chunks(q_in: torch.Tensor) -> torch.Tensor:
-                acc = torch.zeros(n_fov, dtype=q_in.dtype, device=q_in.device)
-                for b0 in range(0, n_beta, chunk_views):
-                    b1 = min(n_beta, b0 + chunk_views)
-                    q_ch = q_in[b0:b1]
-                    m0_ch = m0_all[b0:b1].to(dtype=torch.long)
-                    m1_ch = torch.clamp(m0_ch + 1, max=n_u - 1)
-                    v0_ch = torch.gather(q_ch, 1, m0_ch)
-                    v1_ch = torch.gather(q_ch, 1, m1_ch)
-                    acc = acc + torch.sum(
-                        w0_all[b0:b1] * v0_ch + w1_all[b0:b1] * v1_ch, dim=0
-                    )
-                return acc
-
-            if (
-                torch.is_grad_enabled()
-                and q_filtered.requires_grad
-                and (n_beta * n_fov >= 4_000_000)
-            ):
-                mu_fov = torch.utils.checkpoint.checkpoint(
-                    _backproject_chunks, q_filtered, use_reentrant=False
+            with torch.amp.autocast(device_type=sino_2d.device.type, enabled=False):
+                sino_f32 = sino_2d.to(dtype=torch.float32)
+                geom_t = self._get_cached_geometry_tensors(
+                    beta_1d=beta_1d,
+                    u_coords_mm=u_coords_mm,
+                    du_mm=du_mm,
+                    rho0_mm=rho0_mm,
+                    d0_mm=d0_mm,
+                    image_size=image_size,
+                    fov_mm=fov_mm,
+                    angular_mode=angular_mode,
+                    device=sino_f32.device,
                 )
-            else:
-                mu_fov = _backproject_chunks(q_filtered)
+                n_beta, n_u = sino_f32.shape
+                pad_u = int(geom_t["pad_u"])
+                n_fft = int(geom_t["n_fft"])
 
-            n_xy = int(geom_t["image_size"])
-            mu_slice = torch.zeros((n_xy, n_xy), dtype=sino_2d.dtype, device=sino_2d.device)
-            mu_slice = mu_slice.index_put((geom_t["fov_iy"], geom_t["fov_ix"]), mu_fov)
-            fov_mask = geom_t["fov_mask"]
+                s_weighted = sino_f32 * geom_t["w_pre"]
 
-            hu_slice = 1000.0 * (mu_slice - float(water_mu_mm_inv)) / float(water_mu_mm_inv)
-            hu_slice = torch.where(
-                fov_mask,
-                torch.clamp(hu_slice, min=-1024.0),
-                torch.full_like(hu_slice, -1000.0),
-            )
-            return hu_slice, mu_slice, fov_mask
+                if pad_u > 0:
+                    left_pad = s_weighted[:, 0:1] * geom_t["left_taper"].unsqueeze(0)
+                    right_pad = s_weighted[:, -1:] * geom_t["right_taper"].unsqueeze(0)
+                    s_ext = torch.cat([left_pad, s_weighted, right_pad], dim=1)
+                else:
+                    s_ext = s_weighted
+                s_fft_in = F.pad(s_ext, (0, n_fft - s_ext.shape[1]), mode="constant", value=0.0)
+
+                spec = torch.fft.rfft(s_fft_in, n=n_fft, dim=-1)
+                filtered_full = torch.fft.irfft(spec * geom_t["h_freq"].unsqueeze(0), n=n_fft, dim=-1)
+                q_filtered = filtered_full[:, pad_u : pad_u + n_u]
+
+                n_fov = int(geom_t["fov_iy"].numel())
+                m0_all = geom_t["m0"]
+                w0_all = geom_t["w0"]
+                w1_all = geom_t["w1"]
+                chunk_views = 256
+
+                def _backproject_chunks(q_in: torch.Tensor) -> torch.Tensor:
+                    acc = torch.zeros(n_fov, dtype=q_in.dtype, device=q_in.device)
+                    for b0 in range(0, n_beta, chunk_views):
+                        b1 = min(n_beta, b0 + chunk_views)
+                        q_ch = q_in[b0:b1]
+                        m0_ch = m0_all[b0:b1].to(dtype=torch.long)
+                        m1_ch = torch.clamp(m0_ch + 1, max=n_u - 1)
+                        v0_ch = torch.gather(q_ch, 1, m0_ch)
+                        v1_ch = torch.gather(q_ch, 1, m1_ch)
+                        acc = acc + torch.sum(
+                            w0_all[b0:b1] * v0_ch + w1_all[b0:b1] * v1_ch, dim=0
+                        )
+                    return acc
+
+                if (
+                    torch.is_grad_enabled()
+                    and q_filtered.requires_grad
+                    and (n_beta * n_fov >= 4_000_000)
+                ):
+                    mu_fov = torch.utils.checkpoint.checkpoint(
+                        _backproject_chunks, q_filtered, use_reentrant=False
+                    )
+                else:
+                    mu_fov = _backproject_chunks(q_filtered)
+
+                n_xy = int(geom_t["image_size"])
+                mu_slice = torch.zeros((n_xy, n_xy), dtype=torch.float32, device=sino_f32.device)
+                mu_slice = mu_slice.index_put((geom_t["fov_iy"], geom_t["fov_ix"]), mu_fov)
+                fov_mask = geom_t["fov_mask"]
+
+                hu_slice = 1000.0 * (mu_slice - float(water_mu_mm_inv)) / float(water_mu_mm_inv)
+                hu_slice = torch.where(
+                    fov_mask,
+                    torch.clamp(hu_slice, min=-1024.0),
+                    torch.full_like(hu_slice, -1000.0),
+                )
+                return hu_slice, mu_slice, fov_mask
+
+        def forward_batch(
+            self,
+            sino_batch: torch.Tensor,
+            *,
+            beta_batch: torch.Tensor,
+            u_coords_mm: np.ndarray,
+            du_mm: float,
+            rho0_mm: float,
+            d0_mm: float,
+            image_size: int,
+            fov_mm: float,
+            water_mu_mm_inv: float = 0.0192,
+            angular_mode: str = "short_scan",
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Batched differentiable Parker + Ram-Lak FBP (`(B, N_beta, N_u) -> (B, H, W)`) in strict `float32`.
+
+            Computes per-slice Parker weights and fan-beam backprojection directly on GPU with
+            zero per-slice CPU geometry cache overhead and zero PCIe transfers.
+            """
+            with torch.amp.autocast(device_type=sino_batch.device.type, enabled=False):
+                sino_f32 = sino_batch.to(dtype=torch.float32)
+                bsz, n_beta, n_u = sino_f32.shape
+                st = self._get_static_batch_tensors(
+                    n_beta=n_beta,
+                    u_coords_mm=u_coords_mm,
+                    du_mm=du_mm,
+                    rho0_mm=rho0_mm,
+                    d0_mm=d0_mm,
+                    image_size=image_size,
+                    fov_mm=fov_mm,
+                    device=sino_f32.device,
+                )
+
+                with torch.no_grad():
+                    b64 = beta_batch.to(dtype=torch.float64, device=sino_f32.device)
+                    if angular_mode.strip().lower() == "full_scan":
+                        w_parker = torch.full(
+                            (bsz, n_beta, n_u), 0.5, dtype=torch.float32, device=sino_f32.device
+                        )
+                        d_beta_t = torch.full(
+                            (bsz, 1),
+                            (2.0 * math.pi) / float(n_beta),
+                            dtype=torch.float32,
+                            device=sino_f32.device,
+                        )
+                    else:
+                        span = b64[:, -1:] - b64[:, 0:1]
+                        d_beta_t = (span / float(max(n_beta - 1, 1))).to(dtype=torch.float32)
+                        alpha_row = st["alpha64"].view(1, 1, n_u)
+                        delta = torch.clamp(
+                            0.5 * (span - math.pi), min=float(st["gamma_max"])
+                        ).unsqueeze(2)
+                        b_tilde = (b64 - b64[:, 0:1]).unsqueeze(2).expand(bsz, n_beta, n_u)
+                        lower_bound = 2.0 * (delta - alpha_row)
+                        upper_start = math.pi - 2.0 * alpha_row
+                        total_span = math.pi + 2.0 * delta
+
+                        w64 = torch.ones((bsz, n_beta, n_u), dtype=torch.float64, device=sino_f32.device)
+
+                        in_low = (b_tilde >= -1e-12) & (b_tilde <= lower_bound + 1e-12)
+                        denom_low = (delta - alpha_row).expand(bsz, n_beta, n_u)
+                        reg_low = in_low & (denom_low > 1e-12)
+                        sing_low = in_low & (denom_low <= 1e-12)
+                        eta_low = (0.25 * math.pi) * torch.clamp(
+                            b_tilde / torch.clamp(denom_low, min=1e-12), 0.0, 2.0
+                        )
+                        w64 = torch.where(reg_low, torch.sin(eta_low).square(), w64)
+                        w64 = torch.where(sing_low, torch.full_like(w64, 0.5), w64)
+
+                        in_high = (b_tilde >= upper_start - 1e-12) & (b_tilde <= total_span + 1e-12)
+                        denom_high = (delta + alpha_row).expand(bsz, n_beta, n_u)
+                        reg_high = in_high & (denom_high > 1e-12)
+                        sing_high = in_high & (denom_high <= 1e-12)
+                        eta_high = (0.25 * math.pi) * torch.clamp(
+                            (total_span - b_tilde) / torch.clamp(denom_high, min=1e-12), 0.0, 2.0
+                        )
+                        w64 = torch.where(reg_high, torch.sin(eta_high).square(), w64)
+                        w64 = torch.where(sing_high, torch.full_like(w64, 0.5), w64)
+
+                        outside = (b_tilde < -1e-12) | (b_tilde > total_span + 1e-12)
+                        w64 = torch.where(outside, torch.zeros_like(w64), w64)
+                        w_parker = w64.to(dtype=torch.float32)
+
+                    w_pre = w_parker * st["cos_w"].view(1, 1, n_u)
+                    beta_f32 = b64.to(dtype=torch.float32)
+
+                pad_u = int(st["pad_u"])
+                n_fft = int(st["n_fft"])
+                s_weighted = sino_f32 * w_pre
+
+                if pad_u > 0:
+                    left_pad = s_weighted[:, :, 0:1] * st["left_taper"].view(1, 1, -1)
+                    right_pad = s_weighted[:, :, -1:] * st["right_taper"].view(1, 1, -1)
+                    s_ext = torch.cat([left_pad, s_weighted, right_pad], dim=2)
+                else:
+                    s_ext = s_weighted
+                s_fft_in = F.pad(s_ext, (0, n_fft - s_ext.shape[2]), mode="constant", value=0.0)
+                spec = torch.fft.rfft(s_fft_in, n=n_fft, dim=-1)
+                filtered_full = torch.fft.irfft(
+                    spec * st["h_freq"].view(1, 1, -1), n=n_fft, dim=-1
+                )
+                q_filtered = filtered_full[:, :, pad_u : pad_u + n_u]
+
+                x_fov = st["x_fov"].view(1, 1, -1)
+                y_fov = st["y_fov"].view(1, 1, -1)
+                n_fov = int(st["x_fov"].numel())
+                rho0_f = float(rho0_mm)
+                d0_over_du_f = float(d0_mm) / float(du_mm)
+                c_flat_0_f = float(0.5 * (n_u - 1.0))
+                max_col_f = float(n_u - 1.0)
+                chunk_views = 64 if bsz >= 12 else 128
+
+                def _bp_batch_chunks(q_in: torch.Tensor) -> torch.Tensor:
+                    acc = torch.zeros((bsz, n_fov), dtype=torch.float32, device=q_in.device)
+                    for k0 in range(0, n_beta, chunk_views):
+                        k1 = min(n_beta, k0 + chunk_views)
+                        with torch.no_grad():
+                            b_sub = beta_f32[:, k0:k1]
+                            sin_b = torch.sin(b_sub).unsqueeze(2)
+                            cos_b = torch.cos(b_sub).unsqueeze(2)
+                            d_ray = torch.clamp(rho0_f + sin_b * x_fov - cos_b * y_fov, min=1e-3)
+                            inv_d_ray = 1.0 / d_ray
+                            u_perp = cos_b * x_fov + sin_b * y_fov
+                            m_star = u_perp * inv_d_ray * d0_over_du_f + c_flat_0_f
+                            in_det = ((m_star >= 0.0) & (m_star <= max_col_f)).to(torch.float32)
+                            m_cl = torch.clamp(m_star, 0.0, max_col_f)
+                            m0 = torch.floor(m_cl).to(torch.long)
+                            m1 = torch.clamp(m0 + 1, max=n_u - 1)
+                            wm = m_cl - m0.to(torch.float32)
+                            inv_u = rho0_f * inv_d_ray
+                            w_bp = inv_u * inv_u * in_det
+                            w0_bp = (1.0 - wm) * w_bp
+                            w1_bp = wm * w_bp
+
+                        q_ch = q_in[:, k0:k1, :]
+                        v0 = torch.gather(q_ch, 2, m0)
+                        v1 = torch.gather(q_ch, 2, m1)
+                        acc = acc + torch.sum(w0_bp * v0 + w1_bp * v1, dim=1)
+                    return acc * d_beta_t
+
+                if torch.is_grad_enabled() and q_filtered.requires_grad:
+                    mu_fov = torch.utils.checkpoint.checkpoint(
+                        _bp_batch_chunks, q_filtered, use_reentrant=False
+                    )
+                else:
+                    mu_fov = _bp_batch_chunks(q_filtered)
+
+                n_xy = int(st["image_size"])
+                flat_idx = st["flat_idx"].unsqueeze(0).expand(bsz, -1)
+                mu_flat = torch.zeros((bsz, n_xy * n_xy), dtype=torch.float32, device=sino_f32.device)
+                mu_flat = mu_flat.scatter(1, flat_idx, mu_fov)
+                mu_slices = mu_flat.view(bsz, n_xy, n_xy)
+
+                fov_mask = st["fov_mask"]
+                fov_b = fov_mask.unsqueeze(0).expand(bsz, n_xy, n_xy)
+                hu_slices = 1000.0 * (mu_slices - float(water_mu_mm_inv)) / float(water_mu_mm_inv)
+                hu_slices = torch.where(
+                    fov_b,
+                    torch.clamp(hu_slices, min=-1024.0),
+                    torch.full_like(hu_slices, -1000.0),
+                )
+                return hu_slices, mu_slices, fov_mask
 
     class ImageRefineUNet(nn.Module):
         """Domain-2 Physics-Conditioned 4-Level Image-Domain Residual U-Net (`ImgNet`).
 
         Follows the 4-level encoder-decoder topology of AAPM 2026 Fig. 3:
+          - Inputs (`in_channels=4` default in v1.0):
+            `[x_dc_norm, x_prelim_norm, fov_pitch_map, diff_streak_norm]`
           - Encoder: `c1 (64) -> c2 (128) -> c3 (256) -> c4 (512)` via `AvgPool2d(2)`
           - Bottleneck: `c4 (512)`
           - Decoder: `c4 (512) -> c3 (256) -> c2 (128) -> c1 (64)` via `Bilinear Upsampling + 3x3 Conv`
             with 4 multi-scale skip connections (`concat`)
-          - Global Residual (`+`) on `x_dc_hu` with a physical `Missing-Wedge Gate`
-            (`wedge_gate = clip((missing_fraction - 0.035) / 0.18, 0, 1)`) inside `fov_mask`.
+          - Global Residual (`+`) on `x_dc_hu` in strict `float32` with per-sample vectorized
+            `Missing-Wedge Gate` inside `fov_mask`.
         """
 
         def __init__(
             self,
-            in_channels: int = 3,
+            in_channels: int = 4,
             base_channels: int = 64,
             hu_scale: float = 1000.0,
         ) -> None:
             super().__init__()
+            self.in_channels = int(in_channels)
             self.hu_scale = float(hu_scale)
             c1 = int(base_channels)
             c2 = c1 * 2
             c3 = c1 * 4
             c4 = c1 * 8
 
-            self.enc1 = _ConvResBlock2D(in_channels, c1)
+            self.enc1 = _ConvResBlock2D(self.in_channels, c1)
             self.enc2 = _ConvResBlock2D(c1, c2)
             self.enc3 = _ConvResBlock2D(c2, c3)
             self.enc4 = _ConvResBlock2D(c3, c4)
@@ -842,10 +1133,13 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
 
             self.head = nn.Conv2d(c1, 1, kernel_size=3, padding=1, padding_mode="replicate")
             nn.init.kaiming_normal_(self.head.weight, nonlinearity="linear")
+            head_init_gain = 0.15 if self.in_channels == 4 else 0.05
+            init_res_scale = 0.50 if self.in_channels == 4 else 0.25
             with torch.no_grad():
-                self.head.weight.mul_(0.05)
+                self.head.weight.mul_(head_init_gain)
             nn.init.zeros_(self.head.bias)
-            self.res_scale = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
+            self.res_scale = nn.Parameter(torch.tensor(init_res_scale, dtype=torch.float32))
+            self.force_checkpointing: bool | None = None
 
         def forward(
             self,
@@ -855,20 +1149,23 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             effective_pitch: torch.Tensor | float,
             missing_fraction: torch.Tensor | float = 0.25,
         ) -> torch.Tensor:
-            if isinstance(missing_fraction, torch.Tensor):
-                mf_val = float(missing_fraction.detach().mean().item())
-            else:
-                mf_val = float(missing_fraction)
-            wedge_gate = min(1.0, max(0.0, (mf_val - 0.035) / 0.18))
-
             x_in = build_image_input_tensor(
-                x_dc_hu, x_prelim_hu, fov_mask, effective_pitch, hu_scale=self.hu_scale
+                x_dc_hu,
+                x_prelim_hu,
+                fov_mask,
+                effective_pitch,
+                hu_scale=self.hu_scale,
+                in_channels=self.in_channels,
             )
-            use_ckpt = (
-                self.training
-                and torch.is_grad_enabled()
-                and (x_in.shape[-2] * x_in.shape[-1] >= 65536)
-            )
+            if self.force_checkpointing is not None:
+                use_ckpt = bool(self.force_checkpointing) and self.training and torch.is_grad_enabled()
+            else:
+                use_ckpt = (
+                    self.training
+                    and torch.is_grad_enabled()
+                    and (x_in.shape[-2] * x_in.shape[-1] >= 65536)
+                    and (not _device_has_ample_vram(x_in.device))
+                )
 
             def _blk(mod: nn.Module, t: torch.Tensor) -> torch.Tensor:
                 if use_ckpt:
@@ -895,14 +1192,34 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             u1 = F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False)
             d1 = _blk(self.dec1, torch.cat([u1, e1], dim=1))
 
-            delta_hu = (
-                self.head(d1).squeeze(1) * self.hu_scale * self.res_scale * float(wedge_gate)
-            )
-            if x_dc_hu.ndim == 2:
-                delta_hu = delta_hu.squeeze(0)
-            fov_b = fov_mask.to(dtype=torch.bool, device=x_dc_hu.device)
-            x_refined = torch.clamp(x_dc_hu + delta_hu, min=-1024.0, max=3071.0)
-            return torch.where(fov_b, x_refined, torch.full_like(x_refined, -1000.0))
+            raw_head = self.head(d1).squeeze(1).to(dtype=torch.float32)
+            with torch.amp.autocast(device_type=raw_head.device.type, enabled=False):
+                gate_offset = 0.025 if self.in_channels == 4 else 0.035
+                gate_span = 0.15 if self.in_channels == 4 else 0.18
+                if isinstance(missing_fraction, torch.Tensor):
+                    mf_t = missing_fraction.to(dtype=torch.float32, device=raw_head.device).reshape(
+                        -1, 1, 1
+                    )
+                    wedge_gate: torch.Tensor | float = torch.clamp(
+                        (mf_t - gate_offset) / gate_span, min=0.0, max=1.0
+                    )
+                else:
+                    wedge_gate = min(1.0, max(0.0, (float(missing_fraction) - gate_offset) / gate_span))
+
+                delta_hu = (
+                    raw_head
+                    * float(self.hu_scale)
+                    * self.res_scale.to(dtype=torch.float32)
+                    * wedge_gate
+                )
+                x_dc_f32 = x_dc_hu.to(dtype=torch.float32)
+                if x_dc_f32.ndim == 2 and delta_hu.ndim == 3:
+                    delta_hu = delta_hu.squeeze(0)
+                fov_b = fov_mask.to(dtype=torch.bool, device=x_dc_f32.device)
+                if fov_b.ndim == 2 and x_dc_f32.ndim == 3:
+                    fov_b = fov_b.unsqueeze(0).expand_as(x_dc_f32)
+                x_refined = torch.clamp(x_dc_f32 + delta_hu, min=-1024.0, max=3071.0)
+                return torch.where(fov_b, x_refined, torch.full_like(x_refined, -1000.0))
 
     class DualDomainHighPitchNet(nn.Module):
         """End-to-End Physics-Conditioned Dual-Domain Network (`SinoNet + Parker Ram-Lak FBP Bridge + ImgNet`)."""
@@ -912,6 +1229,7 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
             *,
             sino_base_channels: int = 64,
             img_base_channels: int = 64,
+            img_in_channels: int = 4,
             filter_name: str = "ram_lak",
             cutoff_ratio: float = 1.0,
             lateral_pad_cols: int = 96,
@@ -924,13 +1242,24 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
                 cutoff_ratio=cutoff_ratio,
                 lateral_pad_cols=lateral_pad_cols,
             )
-            self.img_net = ImageRefineUNet(in_channels=3, base_channels=img_base_channels)
+            self.img_net = ImageRefineUNet(
+                in_channels=int(img_in_channels), base_channels=img_base_channels
+            )
             self.sino_device: torch.device = torch.device("cpu")
             self.img_device: torch.device = torch.device("cpu")
 
         def configure_devices(self, primary_device: torch.device) -> dict[str, Any]:
-            """Place Domain-1 (`SinoNet + FBP`) and Domain-2 (`ImgNet`) across available GPUs (`cuda:0` + `cuda:1`)."""
-            if primary_device.type == "cuda" and torch.cuda.device_count() >= 2:
+            """Place Domain-1 (`SinoNet + FBP`) and Domain-2 (`ImgNet`) across available GPUs (`cuda:0` + `cuda:1`).
+
+            Note: If `cuda:0` alone has `>= 22 GiB` VRAM (e.g., `RTX PRO 6000 96 GB` or `A100 80 GB`),
+            co-locating both domains on `primary_device` eliminates cross-GPU PCIe transfers for maximum
+            mini-batch throughput; on smaller dual GPUs (e.g., `2x T4 16 GB`), domain parallelism splits VRAM.
+            """
+            if (
+                primary_device.type == "cuda"
+                and torch.cuda.device_count() >= 2
+                and not _device_has_ample_vram(torch.device("cuda:0"), threshold_gib=22.0)
+            ):
                 self.sino_device = torch.device("cuda:0")
                 self.img_device = torch.device("cuda:1")
             else:
@@ -994,6 +1323,100 @@ def _make_dual_domain_modules() -> tuple[type, type, type, type, type]:
                 "fov_mask": fov_mask_t,
             }
 
+        def forward_domain1_batch(
+            self,
+            batch: dict[str, Any],
+            *,
+            device: torch.device,
+        ) -> dict[str, torch.Tensor]:
+            """Run batched Domain-1 (`SinoNet + HardDC + FBPBridge.forward_batch`) on a mini-batch dict."""
+            sino_dev = next(self.sino_net.parameters()).device
+            s_hp_t = batch["s_hp_raw"].to(device=sino_dev, dtype=torch.float32, non_blocking=True)
+            s_rep_t = batch["s_reproj_dc"].to(device=sino_dev, dtype=torch.float32, non_blocking=True)
+            mask_t = batch["mask_hp"].to(device=sino_dev, dtype=torch.bool, non_blocking=True)
+            eff_p_t = batch["effective_pitch"].to(device=sino_dev, dtype=torch.float32, non_blocking=True)
+            beta_t = batch["beta_rad"].to(device=sino_dev, non_blocking=True)
+
+            s_dc_b, s_pred_b = self.sino_net(s_hp_t, s_rep_t, mask_t, eff_p_t)
+            x_dc_hu, mu_dc, fov_mask_t = self.fbp_bridge.forward_batch(
+                s_dc_b,
+                beta_batch=beta_t,
+                u_coords_mm=batch["u_coords_mm"],
+                du_mm=float(batch["du_mm"]),
+                rho0_mm=float(batch["rho0_mm"]),
+                d0_mm=float(batch["d0_mm"]),
+                image_size=int(batch["image_size"]),
+                fov_mm=float(batch["fov_mm"]),
+                water_mu_mm_inv=float(batch["water_mu_mm_inv"]),
+                angular_mode=str(batch["angular_mode"]),
+            )
+            if sino_dev != device:
+                return {
+                    "s_pred_raw": s_pred_b.to(device, non_blocking=True),
+                    "s_dc": s_dc_b.to(device, non_blocking=True),
+                    "x_dc_hu": x_dc_hu.to(device, non_blocking=True),
+                    "mu_dc": mu_dc.to(device, non_blocking=True),
+                    "fov_mask": fov_mask_t.to(device, non_blocking=True),
+                }
+            return {
+                "s_pred_raw": s_pred_b,
+                "s_dc": s_dc_b,
+                "x_dc_hu": x_dc_hu,
+                "mu_dc": mu_dc,
+                "fov_mask": fov_mask_t,
+            }
+
+        def forward_batch_tensors(
+            self,
+            batch: dict[str, Any],
+            *,
+            device: torch.device,
+        ) -> dict[str, torch.Tensor]:
+            """Run full end-to-end batched Dual-Domain forward pass (`(B, N_beta, N_u) -> (B, H, W)`)."""
+            d1_out = self.forward_domain1_batch(batch, device=device)
+            s_pred_raw = d1_out["s_pred_raw"]
+            s_dc = d1_out["s_dc"]
+            x_dc_hu = d1_out["x_dc_hu"]
+            mu_dc = d1_out["mu_dc"]
+            fov_mask_t = d1_out["fov_mask"]
+
+            img_dev = next(self.img_net.parameters()).device
+            x_pre_t = batch["x_prelim_hu"].to(device=img_dev, dtype=torch.float32, non_blocking=True)
+            eff_p_img = batch["effective_pitch"].to(device=img_dev, dtype=torch.float32, non_blocking=True)
+            miss_f_img = batch["missing_fraction"].to(device=img_dev, dtype=torch.float32, non_blocking=True)
+            x_dc_img = x_dc_hu.to(img_dev, non_blocking=True) if x_dc_hu.device != img_dev else x_dc_hu
+            fov_img = fov_mask_t.to(img_dev, non_blocking=True) if fov_mask_t.device != img_dev else fov_mask_t
+
+            x_final_img = self.img_net(
+                x_dc_img,
+                x_pre_t,
+                fov_img,
+                eff_p_img,
+                missing_fraction=miss_f_img,
+            )
+            x_final_hu = (
+                x_final_img.to(device, non_blocking=True)
+                if x_final_img.device != device
+                else x_final_img
+            )
+            fov_b = fov_mask_t.unsqueeze(0).expand_as(x_final_hu)
+            mu_final = torch.where(
+                fov_b,
+                torch.clamp(
+                    float(batch["water_mu_mm_inv"]) * (1.0 + x_final_hu / 1000.0), min=0.0
+                ),
+                torch.zeros_like(x_final_hu),
+            )
+            return {
+                "s_pred_raw": s_pred_raw,
+                "s_dc": s_dc,
+                "x_dc_hu": x_dc_hu,
+                "mu_dc": mu_dc,
+                "x_final_hu": x_final_hu,
+                "mu_final": mu_final,
+                "fov_mask": fov_mask_t,
+            }
+
         def forward_sample(
             self,
             sample: DualDomainSample,
@@ -1051,6 +1474,7 @@ def create_dual_domain_model(
     *,
     sino_base_channels: int = 64,
     img_base_channels: int = 64,
+    img_in_channels: int = 4,
     filter_name: str = "ram_lak",
     cutoff_ratio: float = 1.0,
     lateral_pad_cols: int = 96,
@@ -1066,6 +1490,7 @@ def create_dual_domain_model(
     model = DualDomainHighPitchNet(
         sino_base_channels=sino_base_channels,
         img_base_channels=img_base_channels,
+        img_in_channels=img_in_channels,
         filter_name=filter_name,
         cutoff_ratio=cutoff_ratio,
         lateral_pad_cols=lateral_pad_cols,
@@ -1170,6 +1595,135 @@ def compute_dual_domain_physics_loss(
         "dc_img_loss": loss_dc_img.detach(),
         "final_img_loss": (loss_fin_l1 + float(lambda_edge_grad) * loss_edge).detach(),
     }
+
+
+def compute_dual_domain_physics_loss_batch(
+    forward_out: dict[str, Any],
+    batch: dict[str, Any],
+    *,
+    device: Any,
+    lambda_sino_wedge: float = 1.5,
+    lambda_sino_grad: float = 0.30,
+    lambda_dc_img: float = 0.35,
+    lambda_final_img: float = 1.0,
+    lambda_edge_grad: float = 0.25,
+    hu_scale: float = 1000.0,
+) -> dict[str, Any]:
+    """Compute composite Physics-Informed Dual-Domain loss on a mini-batch in strict `float32`.
+
+    Supports per-sample `60% ITF + 40% RDC` curriculum weights (`batch['sample_weight']`)
+    with zero CPU-GPU synchronization points inside the autograd graph.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        x_final_hu = forward_out["x_final_hu"].to(device=device, dtype=torch.float32, non_blocking=True)
+        x_dc_hu = forward_out["x_dc_hu"].to(device=device, dtype=torch.float32, non_blocking=True)
+        fov_mask = forward_out["fov_mask"].to(device=device, dtype=torch.bool, non_blocking=True)
+        x_target_t = batch["x_target_hu"].to(device=device, dtype=torch.float32, non_blocking=True)
+        bsz = int(x_final_hu.shape[0])
+
+        if "sample_weight" in batch and batch["sample_weight"] is not None:
+            w_b = batch["sample_weight"].to(device=device, dtype=torch.float32, non_blocking=True).view(bsz)
+        else:
+            w_b = torch.ones(bsz, dtype=torch.float32, device=device)
+        w_sum = torch.clamp(torch.sum(w_b), min=1e-8)
+
+        if "s_dc" in forward_out and forward_out["s_dc"] is not None and "s_target" in batch:
+            s_dc = forward_out["s_dc"].to(device=device, dtype=torch.float32, non_blocking=True)
+            s_target_t = batch["s_target"].to(device=device, dtype=torch.float32, non_blocking=True)
+            mask_hp_t = batch["mask_hp"].to(device=device, dtype=torch.bool, non_blocking=True)
+
+            miss_f = (~mask_hp_t).to(dtype=torch.float32)
+            miss_cnt = torch.sum(miss_f, dim=(1, 2))
+            abs_s = torch.abs(s_dc - s_target_t)
+            sl1_s = F.smooth_l1_loss(s_dc, s_target_t, beta=0.05, reduction="none")
+            wedge_per_sample = torch.where(
+                miss_cnt > 0.5,
+                torch.sum((abs_s + 0.5 * sl1_s) * miss_f, dim=(1, 2)) / torch.clamp(miss_cnt, min=1.0),
+                torch.mean(abs_s, dim=(1, 2)),
+            )
+
+            db_diff = torch.abs(
+                (s_dc[:, 1:, :] - s_dc[:, :-1, :]) - (s_target_t[:, 1:, :] - s_target_t[:, :-1, :])
+            )
+            du_diff = torch.abs(
+                (s_dc[:, :, 1:] - s_dc[:, :, :-1]) - (s_target_t[:, :, 1:] - s_target_t[:, :, :-1])
+            )
+            grad_s_per_sample = 0.5 * (
+                torch.mean(db_diff, dim=(1, 2)) + torch.mean(du_diff, dim=(1, 2))
+            )
+            loss_sino_w = torch.sum(wedge_per_sample * w_b) / w_sum
+            loss_sino_grad = torch.sum(grad_s_per_sample * w_b) / w_sum
+        else:
+            loss_sino_w = torch.zeros((), dtype=torch.float32, device=device)
+            loss_sino_grad = torch.zeros((), dtype=torch.float32, device=device)
+
+        fov_f = fov_mask.to(dtype=torch.float32)
+        if fov_f.ndim == 2:
+            fov_f = fov_f.unsqueeze(0)
+        fov_pix = torch.clamp(torch.sum(fov_f, dim=(1, 2)), min=1.0)
+
+        dc_abs = torch.abs(x_dc_hu - x_target_t) / float(hu_scale)
+        dc_per_sample = torch.sum(dc_abs * fov_f, dim=(1, 2)) / fov_pix
+        loss_dc_img = torch.sum(dc_per_sample * w_b) / w_sum
+
+        fin_abs = torch.abs(x_final_hu - x_target_t) / float(hu_scale)
+        fin_sl1 = F.smooth_l1_loss(
+            x_final_hu / float(hu_scale),
+            x_target_t / float(hu_scale),
+            beta=0.02,
+            reduction="none",
+        )
+        fin_l1_per_sample = torch.sum((fin_abs + 0.5 * fin_sl1) * fov_f, dim=(1, 2)) / fov_pix
+        loss_fin_l1 = torch.sum(fin_l1_per_sample * w_b) / w_sum
+
+        gx_diff = (
+            torch.abs(
+                (x_final_hu[:, :, 1:] - x_final_hu[:, :, :-1])
+                - (x_target_t[:, :, 1:] - x_target_t[:, :, :-1])
+            )
+            / float(hu_scale)
+        )
+        gy_diff = (
+            torch.abs(
+                (x_final_hu[:, 1:, :] - x_final_hu[:, :-1, :])
+                - (x_target_t[:, 1:, :] - x_target_t[:, :-1, :])
+            )
+            / float(hu_scale)
+        )
+        edge_per_sample = 0.5 * (
+            torch.mean(gx_diff, dim=(1, 2)) + torch.mean(gy_diff, dim=(1, 2))
+        )
+        loss_edge = torch.sum(edge_per_sample * w_b) / w_sum
+
+        sino_pretrain_loss = loss_sino_w + 0.30 * loss_sino_grad + float(lambda_dc_img) * loss_dc_img
+        img_pretrain_loss = loss_fin_l1 + float(lambda_edge_grad) * loss_edge
+        joint_finetune_loss = (
+            1.0 * img_pretrain_loss
+            + 0.02 * loss_sino_w
+            + 0.01 * loss_sino_grad
+            + float(lambda_dc_img) * loss_dc_img
+        )
+        total = (
+            float(lambda_sino_wedge) * loss_sino_w
+            + float(lambda_sino_grad) * loss_sino_grad
+            + float(lambda_dc_img) * loss_dc_img
+            + float(lambda_final_img) * loss_fin_l1
+            + float(lambda_edge_grad) * loss_edge
+        )
+        return {
+            "total_loss": total,
+            "sino_pretrain_loss": sino_pretrain_loss,
+            "img_pretrain_loss": img_pretrain_loss,
+            "joint_finetune_loss": joint_finetune_loss,
+            "sino_wedge_loss": loss_sino_w.detach(),
+            "sino_grad_loss": loss_sino_grad.detach(),
+            "dc_img_loss": loss_dc_img.detach(),
+            "final_img_loss": (loss_fin_l1 + float(lambda_edge_grad) * loss_edge).detach(),
+            "weight_sum": w_sum.detach(),
+        }
 
 
 @dataclass(frozen=True)
@@ -2334,23 +2888,27 @@ def save_dual_domain_checkpoint(
     cutoff_ratio: float = 1.0,
     lateral_pad_cols: int = 96,
 ) -> Path:
-    """Save `DualDomainHighPitchNet` weights and architecture config to a `.pt` checkpoint."""
+    """Save `DualDomainHighPitchNet` weights and architecture config atomically to a `.pt` checkpoint."""
     import torch
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    img_in_ch = int(getattr(getattr(model, "img_net", None), "in_channels", 4))
     payload = {
         "model_state_dict": model.state_dict(),
         "config": {
             "sino_base_channels": int(sino_base_channels),
             "img_base_channels": int(img_base_channels),
+            "img_in_channels": img_in_ch,
             "filter_name": normalize_filter_name(filter_name),
             "cutoff_ratio": float(cutoff_ratio),
             "lateral_pad_cols": int(lateral_pad_cols),
         },
         "summary": summary or {},
     }
-    torch.save(payload, out)
+    tmp_out = out.with_suffix(out.suffix + ".tmp")
+    torch.save(payload, tmp_out)
+    tmp_out.replace(out)
     return out
 
 
@@ -2363,17 +2921,26 @@ def load_dual_domain_checkpoint(
     torch, device = resolve_torch_device(backend)
     payload = torch.load(Path(ckpt_path), map_location="cpu", weights_only=False)
     cfg = payload.get("config", {})
+    state_dict = payload["model_state_dict"]
+    if "img_in_channels" in cfg:
+        img_in_ch = int(cfg["img_in_channels"])
+    elif "img_net.enc1.conv1.weight" in state_dict:
+        img_in_ch = int(state_dict["img_net.enc1.conv1.weight"].shape[1])
+    else:
+        img_in_ch = 3
     model, _ = create_dual_domain_model(
         sino_base_channels=int(cfg.get("sino_base_channels", 64)),
         img_base_channels=int(cfg.get("img_base_channels", 64)),
+        img_in_channels=img_in_ch,
         filter_name=str(cfg.get("filter_name", "ram_lak")),
         cutoff_ratio=float(cfg.get("cutoff_ratio", 1.0)),
         lateral_pad_cols=int(cfg.get("lateral_pad_cols", 96)),
         backend=backend,
     )
-    model.load_state_dict(payload["model_state_dict"])
+    model.load_state_dict(state_dict)
     if hasattr(model, "configure_devices"):
         model.configure_devices(device)
     model.eval()
     return model, device, payload
+
 

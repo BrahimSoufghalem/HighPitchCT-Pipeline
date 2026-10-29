@@ -1472,3 +1472,201 @@ def save_stage6_generalization_visual_qa(
     return target
 
 
+def save_stage7_ablation_visual_qa(
+    out_path: str | Path,
+    *,
+    case_id: str,
+    scenario: str,
+    target_pitch: float,
+    z_slice_mm: float,
+    fov_mm: float,
+    fov_mask: np.ndarray,
+    x_target_hu: np.ndarray,
+    method_slices_hu: dict[str, np.ndarray],
+    method_metrics: dict[str, dict[str, float]],
+    display_vmax_hu: float = 400.0,
+) -> Path:
+    """Save 8-panel (2x4) Stage 7 Thesis Ablation Visual QA PNG (`M0..M5` + GT + Line Profile)."""
+    target = Path(out_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    ordered_keys = [
+        ("M0_raw_nofill_fbp", "M0: Raw No-Fill FBP"),
+        ("M1_angular_feather_fbp", "M1: Angular Feather FBP"),
+        ("M2_physics_conjugate_prelim_fbp", "M2: Physics Conjugate Prelim"),
+        ("M3_image_only_dl", "M3: Image-Only U-Net"),
+        ("M4_sino_only_dl", "M4: Sino-Only DL (SinoNet+DC)"),
+        ("M5_full_dual_domain_dl", "M5: Proposed Dual-Domain DL"),
+    ]
+    fmask = np.asarray(fov_mask, dtype=bool)
+    m2_img = method_slices_hu.get("M2_physics_conjugate_prelim_fbp", x_target_hu)
+    m5_img = method_slices_hu.get("M5_full_dual_domain_dl", x_target_hu)
+    err_m2 = np.where(fmask, np.abs(m2_img - x_target_hu), 0.0)
+    err_m5 = np.where(fmask, np.abs(m5_img - x_target_hu), 0.0)
+    split_err = np.empty_like(err_m2)
+    mid_w = err_m2.shape[1] // 2
+    split_err[:, :mid_w] = err_m2[:, :mid_w]
+    split_err[:, mid_w:] = err_m5[:, mid_w:]
+
+    if not _has_matplotlib():
+        panels = [_panel_to_rgb(x_target_hu, vmin=-1000.0, vmax=display_vmax_hu)]
+        for k, _ in ordered_keys:
+            panels.append(
+                _panel_to_rgb(
+                    method_slices_hu.get(k, x_target_hu), vmin=-1000.0, vmax=display_vmax_hu
+                )
+            )
+        panels.append(_panel_to_rgb(split_err, vmin=0.0, vmax=180.0, heat=True))
+        return _compose_grid_png_stdlib(target, panels, ncols=4, tile_h=240, tile_w=240)
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    half_fov = 0.5 * float(fov_mm)
+    extent = [-half_fov, half_fov, -half_fov, half_fov]
+    fig = Figure(figsize=(21.0, 10.5), dpi=135)
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        f"Stage 7 Ablation Study — Unseen Test {case_id} ({scenario.upper()} p={target_pitch:.1f}, z={z_slice_mm:.1f} mm)",
+        fontsize=12.5,
+        fontweight="bold",
+    )
+
+    ax_gt = fig.add_subplot(2, 4, 1)
+    im_gt = ax_gt.imshow(
+        x_target_hu, cmap="gray", vmin=-1000.0, vmax=display_vmax_hu, extent=extent, aspect="equal"
+    )
+    ax_gt.set_title("Reference Target x* (Low-Pitch GT)", fontsize=9.5, fontweight="bold")
+    ax_gt.set_xlabel("x [mm]")
+    ax_gt.set_ylabel("y [mm]")
+    fig.colorbar(im_gt, ax=ax_gt, fraction=0.046, pad=0.04)
+
+    for idx_m, (m_key, m_label) in enumerate(ordered_keys, start=2):
+        ax = fig.add_subplot(2, 4, idx_m)
+        sl = method_slices_hu.get(m_key, x_target_hu)
+        mm = method_metrics.get(m_key, {"rmse_hu": 0.0, "psnr_db": 0.0, "ssim": 0.0})
+        im = ax.imshow(
+            sl, cmap="gray", vmin=-1000.0, vmax=display_vmax_hu, extent=extent, aspect="equal"
+        )
+        ax.set_title(
+            f"{m_label}\nRMSE={mm['rmse_hu']:.1f} HU | PSNR={mm['psnr_db']:.1f} dB | SSIM={mm['ssim']:.3f}",
+            fontsize=8.8,
+        )
+        ax.set_xlabel("x [mm]")
+        ax.set_ylabel("y [mm]")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax_prof = fig.add_subplot(2, 4, 8)
+    mid_row = x_target_hu.shape[0] // 2
+    x_axis = np.linspace(-half_fov, half_fov, x_target_hu.shape[1])
+    ax_prof.plot(x_axis, x_target_hu[mid_row], color="#111111", linewidth=1.6, label="Target x*")
+    ax_prof.plot(
+        x_axis, m2_img[mid_row], color="#d95f02", linewidth=1.1, alpha=0.85, label="M2 Prelim"
+    )
+    if "M4_sino_only_dl" in method_slices_hu:
+        ax_prof.plot(
+            x_axis,
+            method_slices_hu["M4_sino_only_dl"][mid_row],
+            color="#7570b3",
+            linewidth=1.1,
+            alpha=0.85,
+            label="M4 Sino-Only",
+        )
+    ax_prof.plot(
+        x_axis, m5_img[mid_row], color="#1b9e77", linewidth=1.35, label="M5 Dual-Domain"
+    )
+    ax_prof.set_title("Central Axial HU Line Profile (y = 0 mm)", fontsize=9.5)
+    ax_prof.set_xlabel("x [mm]")
+    ax_prof.set_ylabel("Attenuation [HU]")
+    ax_prof.grid(True, alpha=0.25)
+    ax_prof.legend(loc="upper right", fontsize=7.5)
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    fig.savefig(target, format="png")
+    return target
+
+
+def save_stage7_pitch_degradation_curves(
+    out_path: str | Path,
+    *,
+    by_scenario_pitch: dict[str, dict[str, dict[str, float]]],
+) -> Path:
+    """Save 2x2 Stage 7 Pitch Degradation Curves (`RMSE [HU]` & `SSIM` across pitches per scenario)."""
+    target = Path(out_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if not _has_matplotlib():
+        dummy = np.linspace(0.0, 255.0, 240 * 320, dtype=np.float64).reshape(240, 320)
+        return _compose_grid_png_stdlib(target, [_panel_to_rgb(dummy)], ncols=1)
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    method_styles = [
+        ("M0_raw_nofill_fbp", "M0: Raw No-Fill", "#888888", "--"),
+        ("M1_angular_feather_fbp", "M1: Angular Feather", "#e6ab02", "--"),
+        ("M2_physics_conjugate_prelim_fbp", "M2: Conjugate Prelim", "#d95f02", "-."),
+        ("M3_image_only_dl", "M3: Image-Only DL", "#e7298a", ":"),
+        ("M4_sino_only_dl", "M4: Sino-Only DL", "#7570b3", "-"),
+        ("M5_full_dual_domain_dl", "M5: Full Dual-Domain", "#1b9e77", "-"),
+    ]
+
+    scen_pitches: dict[str, list[tuple[float, str]]] = {}
+    for sp_key in by_scenario_pitch:
+        if "_p" not in sp_key:
+            continue
+        sc, p_str = sp_key.split("_p", 1)
+        try:
+            pv = float(p_str)
+        except ValueError:
+            continue
+        scen_pitches.setdefault(sc, []).append((pv, sp_key))
+    for sc in scen_pitches:
+        scen_pitches[sc].sort(key=lambda t: t[0])
+
+    scenarios_sorted = sorted(scen_pitches.keys()) or ["itf"]
+    fig = Figure(figsize=(14.5, 5.2 * max(1, len(scenarios_sorted))), dpi=135)
+    FigureCanvasAgg(fig)
+    fig.suptitle(
+        "Stage 7 Quantitative Ablation Across Clinical High-Pitch Regimes",
+        fontsize=12.5,
+        fontweight="bold",
+    )
+
+    for r_i, sc in enumerate(scenarios_sorted):
+        pts = scen_pitches.get(sc, [])
+        xs = [p for p, _ in pts]
+        ax_r = fig.add_subplot(len(scenarios_sorted), 2, 2 * r_i + 1)
+        ax_s = fig.add_subplot(len(scenarios_sorted), 2, 2 * r_i + 2)
+        for m_key, m_lbl, col, ls in method_styles:
+            ys_rmse = [
+                by_scenario_pitch[k][m_key]["rmse_hu"]
+                for _, k in pts
+                if m_key in by_scenario_pitch.get(k, {})
+            ]
+            ys_ssim = [
+                by_scenario_pitch[k][m_key]["ssim"]
+                for _, k in pts
+                if m_key in by_scenario_pitch.get(k, {})
+            ]
+            if len(ys_rmse) == len(xs) and xs:
+                lw = 2.2 if m_key == "M5_full_dual_domain_dl" else 1.4
+                ax_r.plot(xs, ys_rmse, marker="o", color=col, linestyle=ls, linewidth=lw, label=m_lbl)
+                ax_s.plot(xs, ys_ssim, marker="s", color=col, linestyle=ls, linewidth=lw, label=m_lbl)
+        ax_r.set_title(f"{sc.upper()} — RMSE [HU] vs Target Pitch (Lower is Better)")
+        ax_r.set_xlabel("Target Helical Pitch")
+        ax_r.set_ylabel("RMSE [HU]")
+        ax_r.grid(True, alpha=0.3)
+        ax_r.legend(fontsize=8)
+
+        ax_s.set_title(f"{sc.upper()} — SSIM vs Target Pitch (Higher is Better)")
+        ax_s.set_xlabel("Target Helical Pitch")
+        ax_s.set_ylabel("SSIM")
+        ax_s.grid(True, alpha=0.3)
+        ax_s.legend(fontsize=8)
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    fig.savefig(target, format="png")
+    return target
+
+

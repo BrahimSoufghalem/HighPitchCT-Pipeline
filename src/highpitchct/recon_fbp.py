@@ -164,11 +164,51 @@ def default_scanner_fov_mm(rho0_mm: float, gamma_max_rad: float) -> float:
     return fov
 
 
+def _interp_columns_linear_2d(
+    arr_2d: np.ndarray,
+    valid_mask_2d: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized column-wise 1D linear interpolation matching `np.interp` clamping along axis 0."""
+    n_beta, _ = arr_2d.shape
+    partial_cols = np.any(valid_mask_2d, axis=0) & (~np.all(valid_mask_2d, axis=0))
+    if not np.any(partial_cols):
+        return arr_2d, np.zeros_like(valid_mask_2d, dtype=bool)
+
+    out = arr_2d.copy()
+    filled = np.zeros_like(valid_mask_2d, dtype=bool)
+    col_indices = np.where(partial_cols)[0]
+    sub_mask = valid_mask_2d[:, col_indices]
+    sub_val = out[:, col_indices]
+    n_p = col_indices.size
+
+    rows = np.arange(n_beta, dtype=np.int32)[:, None]
+    prev_idx = np.maximum.accumulate(np.where(sub_mask, rows, -1), axis=0)
+    next_idx = np.minimum.accumulate(np.where(sub_mask, rows, n_beta)[::-1], axis=0)[::-1]
+
+    first_valid = next_idx[0, :]
+    last_valid = prev_idx[-1, :]
+    i0 = np.where(prev_idx < 0, first_valid[None, :], prev_idx)
+    i1 = np.where(next_idx >= n_beta, last_valid[None, :], next_idx)
+
+    col_arange = np.arange(n_p, dtype=np.int32)[None, :]
+    v0 = sub_val[i0, col_arange]
+    v1 = sub_val[i1, col_arange]
+    denom = (i1 - i0).astype(np.float64)
+    w = np.where(i1 > i0, (rows.astype(np.float64) - i0.astype(np.float64)) / np.maximum(denom, 1.0), 0.0)
+    interp_vals = v0 + w * (v1 - v0)
+
+    miss_sub = ~sub_mask
+    out[:, col_indices] = np.where(miss_sub, interp_vals, sub_val)
+    filled[:, col_indices] = miss_sub
+    return out, filled
+
+
 def extrapolate_sinogram(
     ssrb_result: SSRBResult,
     *,
     inpaint_mode: str = "conjugate_feather",
     lateral_pad_cols: int = 96,
+    workers: int = 1,
 ) -> PreparedSinogram:
     """Fill unmeasured high-pitch sinogram wedges without mutating `SSRBResult.measured_mask`.
 
@@ -181,6 +221,8 @@ def extrapolate_sinogram(
         conjugate-ray lookup.
       - 'none': leaves unmeasured pixels at `0.0` (for ablation / artifact demonstration).
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     mode = inpaint_mode.strip().lower()
     if mode not in SUPPORTED_INPAINT_MODES:
         raise ValueError(
@@ -219,10 +261,10 @@ def extrapolate_sinogram(
     m_grid = np.arange(n_u, dtype=np.float64)
     is_full = ssrb_result.angular_mode == "full_scan"
 
-    for s_idx in range(n_slices):
+    def _process_slice(s_idx: int) -> None:
         cur_mask = mask_orig[s_idx].copy()
         if np.all(cur_mask) or not np.any(cur_mask):
-            continue
+            return
 
         cur_sino = completed[s_idx].astype(np.float64, copy=True)
         beta_s = np.asarray(ssrb_result.beta_rad[s_idx], dtype=np.float64)
@@ -263,11 +305,8 @@ def extrapolate_sinogram(
                         continue
                     ks = miss_k[cand_idx]
                     ms = miss_m[cand_idx]
-                    # Exact conjugate angle: beta + alpha' = beta + alpha +/- pi with alpha' = -alpha
-                    # => beta' = beta + 2*alpha +/- pi (sign of +2*alpha is invariant under +/-pi!)
                     b_conj = beta_s[ks] + 2.0 * alpha_u[ms] + sign * math.pi
                     if is_full and n_beta >= 2:
-                        # Wrap into [beta_min, beta_min + 2*pi)
                         b_conj = beta_min + np.mod(b_conj - beta_min, 2.0 * math.pi)
                         in_b = np.ones(cand_idx.size, dtype=bool)
                     else:
@@ -319,25 +358,31 @@ def extrapolate_sinogram(
                     still_missing[win] = False
 
         # Step 2: Smooth angular continuity interpolation per column m
-        for m_idx in range(n_u):
-            col_mask = cur_mask[:, m_idx]
-            if np.all(col_mask) or not np.any(col_mask):
-                continue
-            valid_k = np.where(col_mask)[0]
-            valid_v = cur_sino[valid_k, m_idx]
-            miss_k_col = np.where(~col_mask)[0]
-            if is_full and valid_k.size >= 2:
-                k_ext = np.concatenate([valid_k - n_beta, valid_k, valid_k + n_beta]).astype(np.float64)
-                v_ext = np.concatenate([valid_v, valid_v, valid_v])
-                cur_sino[miss_k_col, m_idx] = np.interp(miss_k_col.astype(np.float64), k_ext, v_ext)
-            else:
-                cur_sino[miss_k_col, m_idx] = np.interp(
-                    miss_k_col.astype(np.float64),
-                    valid_k.astype(np.float64),
-                    valid_v,
-                )
-            cur_mask[miss_k_col, m_idx] = True
-            interp_filled[s_idx, miss_k_col, m_idx] = True
+        if is_full:
+            for m_idx in range(n_u):
+                col_mask = cur_mask[:, m_idx]
+                if np.all(col_mask) or not np.any(col_mask):
+                    continue
+                valid_k = np.where(col_mask)[0]
+                valid_v = cur_sino[valid_k, m_idx]
+                miss_k_col = np.where(~col_mask)[0]
+                if valid_k.size >= 2:
+                    k_ext = np.concatenate([valid_k - n_beta, valid_k, valid_k + n_beta]).astype(np.float64)
+                    v_ext = np.concatenate([valid_v, valid_v, valid_v])
+                    cur_sino[miss_k_col, m_idx] = np.interp(miss_k_col.astype(np.float64), k_ext, v_ext)
+                else:
+                    cur_sino[miss_k_col, m_idx] = np.interp(
+                        miss_k_col.astype(np.float64),
+                        valid_k.astype(np.float64),
+                        valid_v,
+                    )
+                cur_mask[miss_k_col, m_idx] = True
+                interp_filled[s_idx, miss_k_col, m_idx] = True
+        else:
+            cur_sino, col_filled = _interp_columns_linear_2d(cur_sino, cur_mask)
+            if np.any(col_filled):
+                cur_mask |= col_filled
+                interp_filled[s_idx] |= col_filled
 
         # Step 3: Fill any remaining unmeasured pixels along u
         if not np.all(cur_mask):
@@ -363,10 +408,18 @@ def extrapolate_sinogram(
                 pad_u = np.pad(cur_sino, ((0, 0), (1, 1)), mode="edge")
                 smooth_u = 0.25 * pad_u[:, :-2] + 0.50 * pad_u[:, 1:-1] + 0.25 * pad_u[:, 2:]
                 pad_k = np.pad(smooth_u, ((1, 1), (0, 0)), mode="edge")
-                smooth_ku = 0.25 * pad_k[:-2, :] + 0.50 * pad_k[1:-1, :] + 0.25 * pad_k[2:, :]
+                smooth_ku = 0.25 * pad_k[:-2, :] + 0.50 * pad_k[1:-1] + 0.25 * pad_k[2:, :]
                 cur_sino = np.where(unmeas_s, smooth_ku, cur_sino)
 
         completed[s_idx] = np.maximum(cur_sino, 0.0).astype(np.float32)
+
+    n_workers = max(1, int(workers))
+    if n_workers > 1 and n_slices >= 4:
+        with ThreadPoolExecutor(max_workers=min(n_workers, n_slices)) as pool:
+            list(pool.map(_process_slice, range(n_slices)))
+    else:
+        for s_idx in range(n_slices):
+            _process_slice(s_idx)
 
     return PreparedSinogram(
         completed_sinograms=completed,
@@ -717,6 +770,165 @@ def _backproject_slice_torch(
         return acc.detach().cpu().numpy().astype(np.float32)
 
 
+def _reconstruct_fanbeam_fbp_batched_torch(
+    completed_sinograms: np.ndarray,
+    beta_rad: np.ndarray,
+    *,
+    u_coords: np.ndarray,
+    d0_mm: float,
+    rho0_mm: float,
+    du_mm: float,
+    du_iso_mm: float,
+    cos_alpha: np.ndarray,
+    filter_name: str,
+    cutoff_ratio: float,
+    lateral_pad_cols: int,
+    angular_mode: str,
+    x_fov: np.ndarray,
+    y_fov: np.ndarray,
+    fov_iy: np.ndarray,
+    fov_ix: np.ndarray,
+    n_xy: int,
+    require_cuda: bool,
+    angle_chunk: int = 128,
+    progress_bar: Any = None,
+) -> np.ndarray:
+    """Batched multi-slice PyTorch CPU/CUDA Parker + Ram-Lak FBP reconstruction."""
+    try:
+        import torch
+        import torch.nn.functional as F
+    except ImportError as error:
+        raise RuntimeError(
+            "PyTorch (`torch`) is required when backend='torch' or 'torch_cuda'; "
+            "install torch or pass backend='numpy'."
+        ) from error
+
+    if require_cuda and not torch.cuda.is_available():
+        raise RuntimeError(
+            "Explicit backend='torch_cuda' requested, but torch.cuda.is_available() is False. "
+            "Refusing silent fallback."
+        )
+
+    n_slices, n_beta, n_u = completed_sinograms.shape
+    mu_slices = np.zeros((n_slices, n_xy, n_xy), dtype=np.float32)
+    n_pix = int(x_fov.size)
+    if n_slices == 0 or n_pix == 0:
+        return mu_slices
+
+    device = torch.device("cuda" if require_cuda else "cpu")
+    pad = max(0, int(lateral_pad_cols))
+    n_ext = n_u + 2 * pad
+    n_fft = max(64, _next_power_of_two(2 * n_ext))
+    h_rfft = build_fbp_filter_kernel_rfft(
+        n_fft,
+        du_iso_mm,
+        filter_name=filter_name,
+        cutoff_ratio=cutoff_ratio,
+    ).astype(np.float32)
+
+    if pad > 0:
+        idx_p = np.arange(1, pad + 1, dtype=np.float64)
+        left_taper_np = (0.5 * (1.0 - np.cos(math.pi * idx_p / float(pad + 1)))).astype(np.float32)
+        right_taper_np = left_taper_np[::-1].copy()
+    else:
+        left_taper_np = np.zeros(0, dtype=np.float32)
+        right_taper_np = np.zeros(0, dtype=np.float32)
+
+    slice_batch = (16 if n_pix <= 70000 else 8) if require_cuda else 4
+    step = max(16, min(max(int(angle_chunk), 64), 64 if n_pix > 70000 else 128))
+
+    with torch.no_grad():
+        h_t = torch.as_tensor(h_rfft, dtype=torch.float32, device=device).view(1, 1, -1)
+        x_t = torch.as_tensor(np.ascontiguousarray(x_fov, dtype=np.float32), device=device).view(1, 1, -1)
+        y_t = torch.as_tensor(np.ascontiguousarray(y_fov, dtype=np.float32), device=device).view(1, 1, -1)
+        cos_t = torch.as_tensor(np.ascontiguousarray(cos_alpha, dtype=np.float32), device=device).view(1, 1, -1)
+        left_t = torch.as_tensor(left_taper_np, dtype=torch.float32, device=device).view(1, 1, -1)
+        right_t = torch.as_tensor(right_taper_np, dtype=torch.float32, device=device).view(1, 1, -1)
+
+        rho0_f = float(rho0_mm)
+        d0_over_du_f = float(d0_mm / du_mm)
+        c_flat_0_f = float(0.5 * (n_u - 1.0))
+        max_col_f = float(n_u - 1.0)
+
+        for s0 in range(0, n_slices, slice_batch):
+            s1 = min(n_slices, s0 + slice_batch)
+            bsz = s1 - s0
+            w_red_np = np.stack(
+                [
+                    compute_parker_weights(
+                        np.asarray(beta_rad[s], dtype=np.float64),
+                        u_coords,
+                        d0_mm,
+                        angular_mode=angular_mode,
+                    ).astype(np.float32)
+                    for s in range(s0, s1)
+                ],
+                axis=0,
+            )
+            d_beta_np = np.asarray(
+                [
+                    _quadrature_d_beta(np.asarray(beta_rad[s], dtype=np.float64), angular_mode)
+                    for s in range(s0, s1)
+                ],
+                dtype=np.float32,
+            )
+
+            sino_b = torch.as_tensor(
+                np.ascontiguousarray(completed_sinograms[s0:s1], dtype=np.float32), device=device
+            )
+            w_red_b = torch.as_tensor(w_red_np, dtype=torch.float32, device=device)
+            beta_b = torch.as_tensor(
+                np.ascontiguousarray(beta_rad[s0:s1], dtype=np.float32), device=device
+            )
+            d_beta_b = torch.as_tensor(d_beta_np, dtype=torch.float32, device=device).view(bsz, 1)
+
+            g_w = sino_b * w_red_b * cos_t
+            if pad > 0:
+                left_pad = g_w[:, :, 0:1] * left_t
+                right_pad = g_w[:, :, -1:] * right_t
+                g_ext = torch.cat([left_pad, g_w, right_pad], dim=2)
+            else:
+                g_ext = g_w
+            g_fft_in = F.pad(g_ext, (0, n_fft - g_ext.shape[2]), mode="constant", value=0.0)
+            q_full = torch.fft.irfft(
+                torch.fft.rfft(g_fft_in, n=n_fft, dim=-1) * h_t, n=n_fft, dim=-1
+            )
+            q_b = q_full[:, :, pad : pad + n_u]
+
+            acc = torch.zeros((bsz, n_pix), dtype=torch.float32, device=device)
+            for k0 in range(0, n_beta, step):
+                k1 = min(n_beta, k0 + step)
+                b_sub = beta_b[:, k0:k1]
+                sin_b = torch.sin(b_sub).unsqueeze(2)
+                cos_b = torch.cos(b_sub).unsqueeze(2)
+
+                d_ray = torch.clamp(rho0_f + sin_b * x_t - cos_b * y_t, min=1e-3)
+                inv_d_ray = 1.0 / d_ray
+                u_perp = cos_b * x_t + sin_b * y_t
+                m_star = u_perp * inv_d_ray * d0_over_du_f + c_flat_0_f
+
+                in_det = (m_star >= 0.0) & (m_star <= max_col_f)
+                m_cl = torch.clamp(m_star, 0.0, max_col_f)
+                m0 = torch.floor(m_cl).to(torch.long)
+                m1 = torch.clamp(m0 + 1, max=n_u - 1)
+                wm = m_cl - m0.to(torch.float32)
+
+                q_sub = q_b[:, k0:k1, :]
+                v0 = torch.gather(q_sub, 2, m0)
+                v1 = torch.gather(q_sub, 2, m1)
+                q_interp = ((1.0 - wm) * v0 + wm * v1) * in_det.to(torch.float32)
+
+                inv_u = rho0_f * inv_d_ray
+                acc += torch.sum(q_interp * (inv_u * inv_u), dim=1)
+
+            acc *= d_beta_b
+            mu_slices[s0:s1, fov_iy, fov_ix] = acc.detach().cpu().numpy().astype(np.float32)
+            if progress_bar is not None:
+                progress_bar.update(bsz)
+
+    return mu_slices
+
+
 def reconstruct_fanbeam_fbp(
     ssrb_result: SSRBResult,
     *,
@@ -775,13 +987,14 @@ def reconstruct_fanbeam_fbp(
     x_fov = xx_grid[fov_iy, fov_ix]
     y_fov = yy_grid[fov_iy, fov_ix]
 
+    n_slices = ssrb_result.n_slices
     prep = extrapolate_sinogram(
         ssrb_result,
         inpaint_mode=inpaint_mode,
         lateral_pad_cols=lateral_pad_cols,
+        workers=4 if n_slices >= 8 else 1,
     )
 
-    n_slices = ssrb_result.n_slices
     mu_slices = np.zeros((n_slices, n_xy, n_xy), dtype=np.float32)
 
     u_coords = np.asarray(ssrb_result.u_coords_mm, dtype=np.float64)
@@ -799,54 +1012,78 @@ def reconstruct_fanbeam_fbp(
         colour="cyan",
         enabled=show_progress and n_slices > 0,
     ) as bar:
-        for s_idx in range(n_slices):
-            beta_1d = np.asarray(ssrb_result.beta_rad[s_idx], dtype=np.float64)
-            w_red = compute_parker_weights(
-                beta_1d,
-                u_coords,
-                d0,
-                angular_mode=ssrb_result.angular_mode,
-            )
-            g_weighted = (
-                prep.completed_sinograms[s_idx].astype(np.float64) * w_red * cos_alpha[None, :]
-            )
-            q_filtered = filter_weighted_sinogram_2d(
-                g_weighted,
+        if backend_norm in {"torch", "torch_cuda"} and n_slices > 1:
+            mu_slices = _reconstruct_fanbeam_fbp_batched_torch(
+                prep.completed_sinograms,
+                ssrb_result.beta_rad,
+                u_coords=u_coords,
+                d0_mm=d0,
+                rho0_mm=rho0,
+                du_mm=du,
                 du_iso_mm=du_iso,
+                cos_alpha=cos_alpha,
                 filter_name=fname,
                 cutoff_ratio=cutoff_ratio,
                 lateral_pad_cols=lateral_pad_cols,
+                angular_mode=ssrb_result.angular_mode,
+                x_fov=x_fov,
+                y_fov=y_fov,
+                fov_iy=fov_iy,
+                fov_ix=fov_ix,
+                n_xy=n_xy,
+                require_cuda=(backend_norm == "torch_cuda"),
+                angle_chunk=max(angle_chunk, 128),
+                progress_bar=bar,
             )
-            d_beta = _quadrature_d_beta(beta_1d, ssrb_result.angular_mode)
-
-            if backend_norm == "numpy":
-                mu_fov = _backproject_slice_numpy(
-                    q_filtered,
+        else:
+            for s_idx in range(n_slices):
+                beta_1d = np.asarray(ssrb_result.beta_rad[s_idx], dtype=np.float64)
+                w_red = compute_parker_weights(
                     beta_1d,
-                    d_beta=d_beta,
-                    x_fov=x_fov,
-                    y_fov=y_fov,
-                    rho0_mm=rho0,
-                    d0_mm=d0,
-                    du_mm=du,
-                    angle_chunk=angle_chunk,
+                    u_coords,
+                    d0,
+                    angular_mode=ssrb_result.angular_mode,
                 )
-            else:
-                mu_fov = _backproject_slice_torch(
-                    q_filtered,
-                    beta_1d,
-                    d_beta=d_beta,
-                    x_fov=x_fov,
-                    y_fov=y_fov,
-                    rho0_mm=rho0,
-                    d0_mm=d0,
-                    du_mm=du,
-                    require_cuda=(backend_norm == "torch_cuda"),
-                    angle_chunk=max(angle_chunk, 128),
+                g_weighted = (
+                    prep.completed_sinograms[s_idx].astype(np.float64) * w_red * cos_alpha[None, :]
                 )
+                q_filtered = filter_weighted_sinogram_2d(
+                    g_weighted,
+                    du_iso_mm=du_iso,
+                    filter_name=fname,
+                    cutoff_ratio=cutoff_ratio,
+                    lateral_pad_cols=lateral_pad_cols,
+                )
+                d_beta = _quadrature_d_beta(beta_1d, ssrb_result.angular_mode)
 
-            mu_slices[s_idx, fov_iy, fov_ix] = mu_fov
-            bar.update(1)
+                if backend_norm == "numpy":
+                    mu_fov = _backproject_slice_numpy(
+                        q_filtered,
+                        beta_1d,
+                        d_beta=d_beta,
+                        x_fov=x_fov,
+                        y_fov=y_fov,
+                        rho0_mm=rho0,
+                        d0_mm=d0,
+                        du_mm=du,
+                        angle_chunk=angle_chunk,
+                    )
+                else:
+                    mu_fov = _backproject_slice_torch(
+                        q_filtered,
+                        beta_1d,
+                        d_beta=d_beta,
+                        x_fov=x_fov,
+                        y_fov=y_fov,
+                        rho0_mm=rho0,
+                        d0_mm=d0,
+                        du_mm=du,
+                        require_cuda=(backend_norm == "torch_cuda"),
+                        angle_chunk=max(angle_chunk, 128),
+                    )
+
+                mu_slices[s_idx, fov_iy, fov_ix] = mu_fov
+                bar.update(1)
 
     hu_slices = mu_to_hu(mu_slices, water_mu_mm_inv=water_mu_mm_inv)
     if min_hu_clip is not None:
@@ -1108,6 +1345,142 @@ def compute_reconstruction_metrics(
         "psnr_db": round(psnr, 4),
         "ssim": round(float(np.mean(ssim_vals)), 6),
     }
+
+
+def compute_batch_reconstruction_metrics_torch(
+    pred_hu: Any,
+    target_hu: Any,
+    *,
+    fov_mask: Any = None,
+    data_range_hu: float = 2000.0,
+    hu_zero_offset: float = 1000.0,
+    return_per_slice: bool = False,
+) -> dict[str, Any]:
+    """Exact GPU/CPU batched evaluator for `RMSE [HU]`, `MAE [HU]`, `PSNR [dB]`, and 11x11 Gaussian `SSIM`.
+
+    Matches `compute_reconstruction_metrics` to machine precision (`float64` separable 11x11 Gaussian
+    with replicate boundary padding and `hu_zero_offset=1000.0`) while evaluating multi-slice batches
+    in a single vectorized PyTorch pass.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    with torch.no_grad():
+        p = pred_hu if isinstance(pred_hu, torch.Tensor) else torch.as_tensor(pred_hu)
+        t = target_hu if isinstance(target_hu, torch.Tensor) else torch.as_tensor(target_hu, device=p.device)
+        t = t.to(device=p.device)
+        if p.ndim == 2:
+            p = p.unsqueeze(0)
+            t = t.unsqueeze(0)
+        elif p.ndim == 4 and p.shape[1] == 1:
+            p = p.squeeze(1)
+            t = t.squeeze(1)
+        if p.shape != t.shape or p.ndim != 3:
+            raise ValueError(f"Expected matching (B, H, W) tensors, got {tuple(p.shape)} and {tuple(t.shape)}")
+
+        bsz, h, w = p.shape
+        if bsz == 0:
+            base = {"rmse_hu": 0.0, "mae_hu": 0.0, "max_abs_hu": 0.0, "psnr_db": 99.0, "ssim": 1.0}
+            if return_per_slice:
+                empty = np.zeros(0, dtype=np.float64)
+                base.update(
+                    {
+                        "per_slice_rmse_hu": empty,
+                        "per_slice_mae_hu": empty,
+                        "per_slice_max_abs_hu": empty,
+                        "per_slice_psnr_db": empty,
+                        "per_slice_ssim": empty,
+                    }
+                )
+            return base
+
+        p64 = p.to(dtype=torch.float64)
+        t64 = t.to(dtype=torch.float64)
+
+        if fov_mask is not None:
+            m = fov_mask if isinstance(fov_mask, torch.Tensor) else torch.as_tensor(fov_mask, device=p.device)
+            m = m.to(device=p.device, dtype=torch.bool)
+            if m.ndim == 2:
+                m = m.unsqueeze(0).expand(bsz, h, w)
+            elif m.ndim == 3 and m.shape[0] == 1 and bsz > 1:
+                m = m.expand(bsz, h, w)
+        else:
+            m = torch.ones((bsz, h, w), dtype=torch.bool, device=p.device)
+
+        m_f = m.to(dtype=torch.float64)
+        pix_per_slice = torch.clamp(torch.sum(m_f, dim=(1, 2)), min=1.0)
+        diff = (p64 - t64) * m_f
+
+        mse_per_slice = torch.sum(diff * diff, dim=(1, 2)) / pix_per_slice
+        rmse_per_slice = torch.sqrt(mse_per_slice)
+        mae_per_slice = torch.sum(torch.abs(diff), dim=(1, 2)) / pix_per_slice
+        max_per_slice = torch.amax(torch.abs(diff), dim=(1, 2))
+        dr2 = float(data_range_hu) ** 2
+        psnr_per_slice = torch.where(
+            mse_per_slice <= 1e-12,
+            torch.full_like(mse_per_slice, 99.0),
+            10.0 * torch.log10(dr2 / torch.clamp(mse_per_slice, min=1e-12)),
+        )
+
+        coords = torch.arange(-5, 6, dtype=torch.float64, device=p.device)
+        g1d = torch.exp(-(coords * coords) / (2.0 * (1.5 ** 2)))
+        g1d = g1d / torch.sum(g1d)
+        kx = g1d.view(1, 1, 1, 11)
+        ky = g1d.view(1, 1, 11, 1)
+
+        def _blur2d(inp: torch.Tensor) -> torch.Tensor:
+            u = inp.unsqueeze(1)
+            ux = F.conv2d(F.pad(u, (5, 5, 0, 0), mode="replicate"), kx)
+            uxy = F.conv2d(F.pad(ux, (0, 0, 5, 5), mode="replicate"), ky)
+            return uxy.squeeze(1)
+
+        x_pos = torch.clamp(p64 + float(hu_zero_offset), min=0.0)
+        y_pos = torch.clamp(t64 + float(hu_zero_offset), min=0.0)
+
+        mu_x = _blur2d(x_pos)
+        mu_y = _blur2d(y_pos)
+        mu_x2 = mu_x * mu_x
+        mu_y2 = mu_y * mu_y
+        mu_xy = mu_x * mu_y
+
+        sigma_x2 = torch.clamp(_blur2d(x_pos * x_pos) - mu_x2, min=0.0)
+        sigma_y2 = torch.clamp(_blur2d(y_pos * y_pos) - mu_y2, min=0.0)
+        sigma_xy = _blur2d(x_pos * y_pos) - mu_xy
+
+        c1 = (0.01 * float(data_range_hu)) ** 2
+        c2 = (0.03 * float(data_range_hu)) ** 2
+        ssim_map = ((2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)) / (
+            (mu_x2 + mu_y2 + c1) * (sigma_x2 + sigma_y2 + c2)
+        )
+        ssim_per_slice = torch.sum(ssim_map * m_f, dim=(1, 2)) / pix_per_slice
+
+        total_pix = float(torch.sum(m_f).item())
+        if total_pix <= 0.0:
+            global_mse = 0.0
+            global_mae = 0.0
+            global_max = 0.0
+        else:
+            global_mse = float((torch.sum(diff * diff) / total_pix).item())
+            global_mae = float((torch.sum(torch.abs(diff)) / total_pix).item())
+            global_max = float(torch.max(max_per_slice).item())
+        global_rmse = math.sqrt(global_mse)
+        global_psnr = 99.0 if global_mse <= 1e-12 else float(10.0 * math.log10(dr2 / global_mse))
+        global_ssim = float(torch.mean(ssim_per_slice).item())
+
+        result: dict[str, Any] = {
+            "rmse_hu": round(global_rmse, 4),
+            "mae_hu": round(global_mae, 4),
+            "max_abs_hu": round(global_max, 4),
+            "psnr_db": round(global_psnr, 4),
+            "ssim": round(global_ssim, 6),
+        }
+        if return_per_slice:
+            result["per_slice_rmse_hu"] = rmse_per_slice.detach().cpu().numpy()
+            result["per_slice_mae_hu"] = mae_per_slice.detach().cpu().numpy()
+            result["per_slice_max_abs_hu"] = max_per_slice.detach().cpu().numpy()
+            result["per_slice_psnr_db"] = psnr_per_slice.detach().cpu().numpy()
+            result["per_slice_ssim"] = ssim_per_slice.detach().cpu().numpy()
+        return result
 
 
 def reconstruct_series_reference_streaming(

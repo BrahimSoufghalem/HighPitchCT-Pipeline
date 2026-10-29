@@ -1,15 +1,27 @@
-"""Command-line interface for Stage 0, Stage 1, Stage 2, and Stage 3 of HighPitchCT-Pipeline."""
+"""Command-line interface for Stages 0 through 7 and Workstation Scale Engine (v1.0.0)."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+import sys
 import tempfile
 import time
 from typing import Any
 
 import numpy as np
+
+from .ablation import run_stage7_ablation_study
+from .scale_pipeline import (
+    ShardedDualDomainDataset,
+    build_cohort_shards_resumable,
+    build_synthetic_cohort_shards,
+    discover_local_patient_cases,
+    is_shard_complete,
+    train_sharded_dual_domain,
+    verify_three_way_zero_leakage,
+)
 
 from .ctpd_reader import (
     _extract_raw_matrix_fortran,
@@ -1367,7 +1379,7 @@ def _parser() -> argparse.ArgumentParser:
     stage5 = sub.add_parser(
         "stage5-train",
         aliases=["stage5-dl"],
-        help="Stage 5 Physics-Conditioned Dual-Domain DL (60% ITF + 40% RDC, p in {1.5, 2.0, 2.5}, Ram-Lak FBP Bridge) & Visual QA",
+        help="Stage 5 Physics-Conditioned Dual-Domain DL (60%% ITF + 40%% RDC, p in {1.5, 2.0, 2.5}, Ram-Lak FBP Bridge) & Visual QA",
     )
     stage5.add_argument(
         "--data-root",
@@ -1385,7 +1397,7 @@ def _parser() -> argparse.ArgumentParser:
         "--scenario",
         choices=["rdc", "itf", "both"],
         default="both",
-        help="High-pitch scenarios to include in dataset (default: both -> 60% ITF + 40% RDC)",
+        help="High-pitch scenarios to include in dataset (default: both -> 60%% ITF + 40%% RDC)",
     )
     stage5.add_argument(
         "--itf-ratio",
@@ -1547,7 +1559,7 @@ def _parser() -> argparse.ArgumentParser:
         "--scenario",
         choices=["rdc", "itf", "both"],
         default="both",
-        help="High-pitch scenarios to include (default: both -> 60% ITF + 40% RDC)",
+        help="High-pitch scenarios to include (default: both -> 60%% ITF + 40%% RDC)",
     )
     stage6.add_argument(
         "--itf-ratio",
@@ -1649,6 +1661,89 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage6.add_argument("--workers", type=int, default=4)
     stage6.add_argument("--no-progress", action="store_true")
+
+    scale = sub.add_parser(
+        "stage6-scale",
+        aliases=["train-scale"],
+        help="Workstation-scale (v1.0) 35-patient (~50,000 full-volume slices) resumable sharding + 100-epoch Val training",
+    )
+    scale.add_argument("--data-root", "--workspace", dest="data_root")
+    scale.add_argument("--shards-root", default=None, help="Directory for patient .npy shards (default: <data-root>/shards)")
+    scale.add_argument("--checkpoint-dir", default=None, help="Checkpoint directory (default: <data-root>/checkpoints/scale_v1)")
+    scale.add_argument("--n-train", type=int, default=25, help="Target training patient count (default: 25)")
+    scale.add_argument("--n-val", type=int, default=5, help="Target validation patient count (default: 5)")
+    scale.add_argument("--n-test", type=int, default=5, help="Target unseen test patient count (default: 5)")
+    scale.add_argument("--train-cases", default=None, help="Optional comma-separated explicit train case IDs")
+    scale.add_argument("--val-cases", default=None, help="Optional comma-separated explicit val case IDs")
+    scale.add_argument("--test-cases", default=None, help="Optional comma-separated explicit test case IDs")
+    scale.add_argument(
+        "--target-total-samples",
+        type=int,
+        default=50000,
+        help="Target total high-pitch slices across cohort (~50,000 default; set 0 to use --slice-spacing-mm)",
+    )
+    scale.add_argument("--slice-spacing-mm", type=float, default=None, help="Optional explicit axial slice spacing [mm] (e.g. 1.25)")
+    scale.add_argument("--max-slices-per-patient", type=int, default=None, help="Optional cap on slices per patient")
+    scale.add_argument("--pitches", default="1.5,2.0,2.5", help="Comma-separated high-pitch targets")
+    scale.add_argument("--scenario", choices=["rdc", "itf", "both"], default="both")
+    scale.add_argument("--itf-ratio", type=float, default=DEFAULT_ITF_TRAINING_RATIO)
+    scale.add_argument("--image-size", "--n-xy", dest="image_size", type=int, default=256)
+    scale.add_argument("--fov-mm", type=float, default=None)
+    scale.add_argument(
+        "--filter",
+        "--filter-name",
+        dest="filter_name",
+        choices=["ram_lak", "ram-lak", "ramp", "shepp_logan", "cosine", "hamming", "hann"],
+        default="ram_lak",
+    )
+    scale.add_argument("--cutoff-ratio", type=float, default=1.0)
+    scale.add_argument(
+        "--inpaint-mode",
+        choices=["conjugate_feather", "angular_feather", "none"],
+        default="conjugate_feather",
+    )
+    scale.add_argument("--epochs", type=int, default=100, help="Total 3-stage training epochs (default: 100)")
+    scale.add_argument("--batch-size", type=int, default=16, help="GPU mini-batch size (default: 16)")
+    scale.add_argument("--eval-batch-size", type=int, default=None)
+    scale.add_argument("--lr", type=float, default=1.5e-3)
+    scale.add_argument("--sino-channels", type=int, default=64)
+    scale.add_argument("--img-channels", type=int, default=64)
+    scale.add_argument("--img-in-channels", type=int, default=4, choices=[3, 4])
+    scale.add_argument("--backend", choices=["torch", "torch_cuda"], default="torch_cuda")
+    scale.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto")
+    scale.add_argument("--workers", type=int, default=8, help="Parallel CPU workers for DICOM/SSRB")
+    scale.add_argument("--num-loader-workers", type=int, default=4, help="PyTorch DataLoader worker processes")
+    scale.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically resume completed shards and latest epoch checkpoint (default: --resume)",
+    )
+    scale.add_argument("--force-rebuild-shards", action="store_true")
+    scale.add_argument("--run-stage7-ablation", action="store_true", help="Run Stage 7 6-method Ablation immediately after training")
+    scale.add_argument("--m3-epochs", type=int, default=15, help="Epochs for standalone M3 Image-Only baseline when running Stage 7")
+    scale.add_argument("--run-phantom-check", action="store_true", help="Run synthetic sharded cohort check if no real data is present")
+    scale.add_argument("--seed", type=int, default=42)
+    scale.add_argument("--no-progress", action="store_true")
+
+    stage7 = sub.add_parser(
+        "stage7-ablation",
+        aliases=["ablation"],
+        help="Stage 7 Comprehensive 6-Method Thesis Ablation Study (M0..M5) on Held-Out Test Shards",
+    )
+    stage7.add_argument("--data-root", "--workspace", dest="data_root")
+    stage7.add_argument("--shards-root", default=None, help="Shards directory containing train/val/test (default: <data-root>/shards)")
+    stage7.add_argument("--checkpoint", "--load-model", dest="checkpoint", default=None, help="Trained DualDomainHighPitchNet .pt checkpoint")
+    stage7.add_argument("--output-dir", default=None, help="Output directory for Stage 7 CSV/JSON/figures")
+    stage7.add_argument("--m3-epochs", type=int, default=15, help="Epochs to train standalone M3 Image-Only U-Net baseline (0 to skip)")
+    stage7.add_argument("--batch-size", type=int, default=16)
+    stage7.add_argument("--lr", type=float, default=1.5e-3)
+    stage7.add_argument("--backend", choices=["torch", "torch_cuda"], default="torch_cuda")
+    stage7.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto")
+    stage7.add_argument("--num-loader-workers", type=int, default=4)
+    stage7.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    stage7.add_argument("--seed", type=int, default=42)
+    stage7.add_argument("--no-progress", action="store_true")
 
     environment = sub.add_parser(
         "env", help="Report Kaggle/Full profile, disk quota, RAM, disk space, and GPUs"
@@ -3018,6 +3113,255 @@ def main(argv: list[str] | None = None) -> int:
                 ts.pop("training_history", None)
         print(json.dumps(stdout_report, separators=(",", ":")), flush=True)
         return 0 if all_pass else 1
+
+    if args.command in ("stage6-scale", "train-scale"):
+        t_start = time.monotonic()
+        env_prof = resolve_environment_profile(data_root=args.data_root)
+        show_prog = not args.no_progress
+        shards_root = (
+            Path(args.shards_root).expanduser().resolve()
+            if args.shards_root
+            else (env_prof.data_root / "shards")
+        )
+        ckpt_dir = (
+            Path(args.checkpoint_dir).expanduser().resolve()
+            if args.checkpoint_dir
+            else (env_prof.data_root / "checkpoints" / "scale_v1")
+        )
+        fname = normalize_filter_name(args.filter_name)
+        pitch_list = [float(p.strip()) for p in str(args.pitches).split(",") if p.strip()]
+        scenarios_list = (
+            ["itf", "rdc"] if args.scenario == "both" else [args.scenario.strip().lower()]
+        )
+
+        patient_records = discover_local_patient_cases(env_prof.data_root / "raw" / "tcia")
+        if patient_records:
+            tr_c = (
+                [c.strip() for c in str(args.train_cases).split(",") if c.strip()]
+                if args.train_cases
+                else None
+            )
+            va_c = (
+                [c.strip() for c in str(args.val_cases).split(",") if c.strip()]
+                if args.val_cases
+                else None
+            )
+            te_c = (
+                [c.strip() for c in str(args.test_cases).split(",") if c.strip()]
+                if args.test_cases
+                else None
+            )
+            cohort_info = build_cohort_shards_resumable(
+                patient_records,
+                shards_root,
+                n_train=int(args.n_train),
+                n_val=int(args.n_val),
+                n_test=int(args.n_test),
+                train_case_ids=tr_c,
+                val_case_ids=va_c,
+                test_case_ids=te_c,
+                target_total_samples=(
+                    int(args.target_total_samples)
+                    if int(args.target_total_samples) > 0
+                    else None
+                ),
+                slice_spacing_mm=args.slice_spacing_mm,
+                max_slices_per_patient=args.max_slices_per_patient,
+                pitches=pitch_list,
+                scenarios=scenarios_list,
+                image_size=int(args.image_size),
+                fov_mm=args.fov_mm,
+                filter_name=fname,
+                cutoff_ratio=float(args.cutoff_ratio),
+                inpaint_mode=args.inpaint_mode,
+                backend=args.backend,
+                workers=max(1, int(args.workers)),
+                seed=int(args.seed),
+                force_rebuild=bool(args.force_rebuild_shards),
+                show_progress=show_prog,
+            )
+        elif args.run_phantom_check:
+            cohort_info = build_synthetic_cohort_shards(
+                shards_root / "synthetic_check",
+                n_train_cases=2,
+                n_val_cases=1,
+                n_test_cases=1,
+                slices_per_case=2,
+                image_size=min(128, int(args.image_size)),
+                pitches=pitch_list[:2] if len(pitch_list) >= 2 else pitch_list,
+                scenarios=scenarios_list,
+                backend=args.backend,
+            )
+        else:
+            raise SystemExit(
+                f"No patient projection series found under {env_prof.data_root / 'raw' / 'tcia'}. "
+                "Download TCIA patients first or pass --run-phantom-check."
+            )
+
+        train_ds = ShardedDualDomainDataset(
+            cohort_info["train_shard_dirs"], itf_ratio=float(args.itf_ratio), seed=int(args.seed)
+        )
+        val_ds = ShardedDualDomainDataset(
+            cohort_info["val_shard_dirs"], itf_ratio=float(args.itf_ratio), seed=int(args.seed)
+        )
+        test_ds = ShardedDualDomainDataset(
+            cohort_info["test_shard_dirs"], itf_ratio=float(args.itf_ratio), seed=int(args.seed)
+        )
+
+        train_out = train_sharded_dual_domain(
+            train_ds,
+            val_ds,
+            checkpoint_dir=ckpt_dir,
+            test_dataset=test_ds,
+            epochs=int(args.epochs),
+            batch_size=int(args.batch_size),
+            eval_batch_size=args.eval_batch_size,
+            lr=float(args.lr),
+            sino_base_channels=int(args.sino_channels),
+            img_base_channels=int(args.img_channels),
+            img_in_channels=int(args.img_in_channels),
+            filter_name=fname,
+            cutoff_ratio=float(args.cutoff_ratio),
+            backend=args.backend,
+            amp_mode=args.amp,
+            num_workers=int(args.num_loader_workers),
+            resume=bool(args.resume),
+            seed=int(args.seed),
+            show_progress=show_prog,
+        )
+
+        ablation_out = None
+        if args.run_stage7_ablation:
+            ablation_out = run_stage7_ablation_study(
+                test_ds,
+                dual_model=train_out["model"],
+                train_dataset=train_ds,
+                val_dataset=val_ds,
+                output_dir=env_prof.data_root / "manifests" / "stage7_ablation",
+                figures_dir=env_prof.data_root / "manifests" / "figures",
+                m3_epochs=int(args.m3_epochs),
+                batch_size=int(args.batch_size),
+                lr=float(args.lr),
+                backend=args.backend,
+                amp_mode=args.amp,
+                num_workers=int(args.num_loader_workers),
+                resume=bool(args.resume),
+                seed=int(args.seed),
+                show_progress=show_prog,
+            )
+
+        audit = verify_three_way_zero_leakage(
+            train_ds.case_ids,
+            val_ds.case_ids,
+            test_ds.case_ids,
+            train_sample_count=len(train_ds),
+            val_sample_count=len(val_ds),
+            test_sample_count=len(test_ds),
+        )
+        ut = train_out["unseen_test_metrics"]
+        scale_pass = bool(
+            audit["overall_zero_leakage_pass"]
+            and ut is not None
+            and ut["measured_rays_max_abs_dev"] == 0.0
+            and ut["final_dual_domain"]["rmse_hu"] <= ut["prelim_fbp"]["rmse_hu"] + 1e-4
+            and (ablation_out["overall_pass"] if ablation_out is not None else True)
+        )
+        full_report = {
+            "stage": "Stage 6 Workstation Scale + Stage 7 (v1.0.0)",
+            "overall_pass": scale_pass,
+            "elapsed_seconds": round(time.monotonic() - t_start, 2),
+            "zero_leakage_audit": audit,
+            "device_configuration": train_out["device_configuration"],
+            "amp_enabled": train_out["amp_enabled"],
+            "amp_dtype": train_out["amp_dtype"],
+            "epochs_completed": train_out["epochs_completed"],
+            "best_val_epoch": train_out["best_val_epoch"],
+            "best_checkpoint_pt": train_out["best_checkpoint_pt"],
+            "latest_resume_state_pt": train_out["latest_resume_state_pt"],
+            "val_metrics": train_out["val_metrics"],
+            "unseen_test_metrics": train_out["unseen_test_metrics"],
+            "stage7_ablation_summary": (
+                {
+                    "overall_pass": ablation_out["overall_pass"],
+                    "ablation_csv": ablation_out["ablation_csv"],
+                    "report_json": ablation_out["report_json"],
+                    "visual_qa_grid_png": ablation_out["visual_qa_grid_png"],
+                    "pitch_curves_png": ablation_out["pitch_curves_png"],
+                    "overall_ablation_matrix": ablation_out["overall_ablation_matrix"],
+                }
+                if ablation_out is not None
+                else None
+            ),
+            "history": train_out["history"],
+        }
+        out_json = env_prof.data_root / "manifests" / "stage6_scale_report.json"
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        full_report["report_json"] = str(out_json)
+        out_json.write_text(json.dumps(full_report, indent=2), encoding="utf-8")
+        compact = {k: v for k, v in full_report.items() if k != "history"}
+        print(json.dumps(compact, indent=2), flush=True)
+        return 0 if scale_pass else 1
+
+    if args.command in ("stage7-ablation", "ablation"):
+        env_prof = resolve_environment_profile(data_root=args.data_root)
+        show_prog = not args.no_progress
+        shards_root = (
+            Path(args.shards_root).expanduser().resolve()
+            if args.shards_root
+            else (env_prof.data_root / "shards")
+        )
+        ckpt_pt = (
+            Path(args.checkpoint).expanduser().resolve()
+            if args.checkpoint
+            else (env_prof.data_root / "checkpoints" / "scale_v1" / "best_val_dual_domain.pt")
+        )
+        if not ckpt_pt.is_file():
+            raise SystemExit(f"Dual-Domain checkpoint not found: {ckpt_pt}")
+
+        def _list_split_shards(sp: str) -> list[Path]:
+            d = shards_root / sp
+            if not d.is_dir():
+                return []
+            return sorted(p for p in d.iterdir() if p.is_dir() and is_shard_complete(p))
+
+        te_dirs = _list_split_shards("test")
+        if not te_dirs:
+            raise SystemExit(f"No completed unseen Test shards found under {shards_root / 'test'}")
+        tr_dirs = _list_split_shards("train")
+        va_dirs = _list_split_shards("val")
+
+        test_ds = ShardedDualDomainDataset(te_dirs, seed=int(args.seed))
+        train_ds = ShardedDualDomainDataset(tr_dirs, seed=int(args.seed)) if tr_dirs else None
+        val_ds = ShardedDualDomainDataset(va_dirs, seed=int(args.seed)) if va_dirs else None
+        out_dir = (
+            Path(args.output_dir).expanduser().resolve()
+            if args.output_dir
+            else (env_prof.data_root / "manifests" / "stage7_ablation")
+        )
+        ab_report = run_stage7_ablation_study(
+            test_ds,
+            dual_checkpoint_path=ckpt_pt,
+            train_dataset=train_ds,
+            val_dataset=val_ds,
+            output_dir=out_dir,
+            figures_dir=env_prof.data_root / "manifests" / "figures",
+            m3_epochs=int(args.m3_epochs),
+            batch_size=int(args.batch_size),
+            lr=float(args.lr),
+            backend=args.backend,
+            amp_mode=args.amp,
+            num_workers=int(args.num_loader_workers),
+            resume=bool(args.resume),
+            seed=int(args.seed),
+            show_progress=show_prog,
+        )
+        compact_ab = {
+            k: v
+            for k, v in ab_report.items()
+            if k not in {"by_patient", "by_scenario_pitch"}
+        }
+        print(json.dumps(compact_ab, indent=2), flush=True)
+        return 0 if ab_report["overall_pass"] else 1
 
     # download command
     specs = read_series_manifest(args.series_file)

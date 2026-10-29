@@ -50,6 +50,7 @@ from .rebinning import (
 from .recon_fbp import (
     FBPReconstructionResult,
     SUPPORTED_FBP_BACKENDS,
+    _interp_columns_linear_2d,
     compute_parker_weights,
     compute_reconstruction_metrics,
     default_scanner_fov_mm,
@@ -362,6 +363,135 @@ def _project_fanbeam_slice_torch(
     return sino_out
 
 
+def _project_fanbeam_batched_torch(
+    mu_slices: np.ndarray,
+    beta_rad: np.ndarray,
+    u_coords_mm: np.ndarray,
+    *,
+    rho0_mm: float,
+    d0_mm: float,
+    fov_mm: float,
+    center_xy_mm: tuple[float, float] = (0.0, 0.0),
+    step_factor: float = 0.5,
+    require_cuda: bool = False,
+    angle_chunk: int = 64,
+    progress_bar: Any = None,
+) -> np.ndarray:
+    """Batched multi-slice 2D equispaced fan-beam projector in PyTorch (`torch` or `torch_cuda`)."""
+    try:
+        import torch
+        import torch.nn.functional as F
+    except ImportError as error:
+        raise RuntimeError(
+            "PyTorch is required when backend is 'torch' or 'torch_cuda' (no silent fallback)."
+        ) from error
+
+    if require_cuda and not torch.cuda.is_available():
+        raise RuntimeError(
+            "backend='torch_cuda' was explicitly requested for forward projection, "
+            "but torch.cuda.is_available() is False (no silent fallback)."
+        )
+
+    n_slices, n_xy, _ = mu_slices.shape
+    n_beta = int(beta_rad.shape[1])
+    n_u = int(u_coords_mm.size)
+    out = np.zeros((n_slices, n_beta, n_u), dtype=np.float32)
+    if n_slices == 0 or n_beta == 0 or n_u == 0:
+        return out
+
+    device = torch.device("cuda" if require_cuda else "cpu")
+    d_xy = float(fov_mm) / float(n_xy)
+    half_idx = 0.5 * (n_xy - 1.0)
+    cx = float(center_xy_mm[0])
+    cy = float(center_xy_mm[1])
+
+    alpha_u = np.arctan2(np.asarray(u_coords_mm, dtype=np.float64), float(d0_mm))
+    t_iso = float(rho0_mm) * np.cos(alpha_u)
+
+    r_bound = 0.5 * math.sqrt(2.0) * float(fov_mm) + math.hypot(cx, cy) + d_xy
+    ds = max(0.1 * d_xy, float(step_factor) * d_xy)
+    n_steps = max(8, int(math.ceil((2.0 * r_bound) / ds)) + 1)
+    tau = np.linspace(-r_bound, r_bound, n_steps, dtype=np.float64)
+    dt = float(tau[1] - tau[0]) if n_steps > 1 else float(2.0 * r_bound)
+
+    if require_cuda:
+        vram_bytes = torch.cuda.get_device_properties(device).total_memory
+        slice_batch = 16 if (vram_bytes >= 22 * (1024**3) and n_xy <= 256) else 8
+    else:
+        slice_batch = 4
+    k_step = max(16, min(int(angle_chunk), 64 if n_xy > 256 else 96))
+
+    with torch.no_grad():
+        alpha_t = torch.as_tensor(alpha_u, dtype=torch.float32, device=device).view(1, 1, n_u)
+        t_grid_t = torch.as_tensor(
+            (t_iso[:, None] + tau[None, :]).astype(np.float32),
+            dtype=torch.float32,
+            device=device,
+        ).view(1, 1, n_u, n_steps)
+
+        scale_norm = float(2.0 / max(float(n_xy - 1), 1.0))
+        inv_dxy = float(1.0 / d_xy)
+        half_idx_f = float(half_idx)
+        cx_f = float(cx)
+        cy_f = float(cy)
+        rho0_f = float(rho0_mm)
+        max_xy_f = float(n_xy - 1)
+
+        for s0 in range(0, n_slices, slice_batch):
+            s1 = min(n_slices, s0 + slice_batch)
+            bsz = s1 - s0
+            img_t = torch.as_tensor(
+                np.ascontiguousarray(mu_slices[s0:s1], dtype=np.float32), device=device
+            ).unsqueeze(1)
+            beta_b = torch.as_tensor(
+                np.ascontiguousarray(beta_rad[s0:s1], dtype=np.float32), device=device
+            )
+            sino_gpu = torch.empty((bsz, n_beta, n_u), dtype=torch.float32, device=device)
+
+            for k0 in range(0, n_beta, k_step):
+                k1 = min(n_beta, k0 + k_step)
+                kc = k1 - k0
+                b_sub = beta_b[:, k0:k1]
+                sx = (-rho0_f * torch.sin(b_sub)).view(bsz, kc, 1, 1)
+                sy = (rho0_f * torch.cos(b_sub)).view(bsz, kc, 1, 1)
+
+                theta = b_sub.unsqueeze(2) + alpha_t
+                ex = torch.sin(theta).unsqueeze(3)
+                ey = (-torch.cos(theta)).unsqueeze(3)
+
+                x_pts = sx + t_grid_t * ex
+                y_pts = sy + t_grid_t * ey
+
+                col_f = half_idx_f - (x_pts - cx_f) * inv_dxy
+                row_f = half_idx_f - (y_pts - cy_f) * inv_dxy
+                valid_m = (
+                    (col_f >= 0.0)
+                    & (col_f <= max_xy_f)
+                    & (row_f >= 0.0)
+                    & (row_f <= max_xy_f)
+                )
+
+                gx = col_f * scale_norm - 1.0
+                gy = row_f * scale_norm - 1.0
+                grid = torch.stack([gx, gy], dim=-1).view(bsz, kc * n_u, n_steps, 2)
+
+                sampled = F.grid_sample(
+                    img_t,
+                    grid,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=True,
+                ).view(bsz, kc, n_u, n_steps)
+                sampled = torch.where(valid_m, sampled, torch.zeros_like(sampled))
+                sino_gpu[:, k0:k1, :] = torch.sum(sampled, dim=3) * float(dt)
+
+            out[s0:s1] = sino_gpu.detach().cpu().numpy().astype(np.float32)
+            if progress_bar is not None:
+                progress_bar.update(bsz)
+
+    return out
+
+
 def forward_project_fanbeam_2d(
     mu_slices: np.ndarray,
     beta_rad: np.ndarray,
@@ -423,33 +553,48 @@ def forward_project_fanbeam_2d(
         colour="magenta",
         enabled=show_progress and n_slices > 0,
     ) as bar:
-        for s_idx in range(n_slices):
-            if backend_norm == "numpy":
-                out[s_idx] = _project_fanbeam_slice_numpy(
-                    arr[s_idx],
-                    b_arr[s_idx],
-                    u_arr,
-                    rho0_mm=rho0_mm,
-                    d0_mm=d0_mm,
-                    fov_mm=fov_mm,
-                    center_xy_mm=center_xy_mm,
-                    step_factor=step_factor,
-                    angle_chunk=angle_chunk,
-                )
-            else:
-                out[s_idx] = _project_fanbeam_slice_torch(
-                    arr[s_idx],
-                    b_arr[s_idx],
-                    u_arr,
-                    rho0_mm=rho0_mm,
-                    d0_mm=d0_mm,
-                    fov_mm=fov_mm,
-                    center_xy_mm=center_xy_mm,
-                    step_factor=step_factor,
-                    require_cuda=(backend_norm == "torch_cuda"),
-                    angle_chunk=max(angle_chunk, 128),
-                )
-            bar.update(1)
+        if backend_norm in {"torch", "torch_cuda"} and n_slices > 1:
+            out = _project_fanbeam_batched_torch(
+                arr,
+                b_arr,
+                u_arr,
+                rho0_mm=rho0_mm,
+                d0_mm=d0_mm,
+                fov_mm=fov_mm,
+                center_xy_mm=center_xy_mm,
+                step_factor=step_factor,
+                require_cuda=(backend_norm == "torch_cuda"),
+                angle_chunk=max(angle_chunk, 64),
+                progress_bar=bar,
+            )
+        else:
+            for s_idx in range(n_slices):
+                if backend_norm == "numpy":
+                    out[s_idx] = _project_fanbeam_slice_numpy(
+                        arr[s_idx],
+                        b_arr[s_idx],
+                        u_arr,
+                        rho0_mm=rho0_mm,
+                        d0_mm=d0_mm,
+                        fov_mm=fov_mm,
+                        center_xy_mm=center_xy_mm,
+                        step_factor=step_factor,
+                        angle_chunk=angle_chunk,
+                    )
+                else:
+                    out[s_idx] = _project_fanbeam_slice_torch(
+                        arr[s_idx],
+                        b_arr[s_idx],
+                        u_arr,
+                        rho0_mm=rho0_mm,
+                        d0_mm=d0_mm,
+                        fov_mm=fov_mm,
+                        center_xy_mm=center_xy_mm,
+                        step_factor=step_factor,
+                        require_cuda=(backend_norm == "torch_cuda"),
+                        angle_chunk=max(angle_chunk, 128),
+                    )
+                bar.update(1)
 
     return out[0] if single_2d else out
 
@@ -613,12 +758,14 @@ def forward_project_helical_3d(
     step_mm: float | None = None,
     z_boundary_mode: str = "clamp",
     backend: str = "numpy",
+    view_batch: int | None = None,
+    progress_callback: Any = None,
     show_progress: bool = False,
 ) -> np.ndarray:
     """Ray-driven 3D Helical Cone-Beam Forward Projector `P_helical: mu(z, y, x) -> g(i, r, c)`.
 
     Uses exact 3D source positions `S(i)` (including 3D Flying Focal Spot shifts `drho, dphi, dz`)
-    and 3D detector element coordinates `D(i, r, c)` from `geometry.ray_origins_and_directions(i)`.
+    and 3D detector element coordinates `D(i, r, c)` from `geometry.ray_origins_and_directions(...)`.
     """
     backend_norm = backend.strip().lower()
     if backend_norm not in SUPPORTED_FBP_BACKENDS:
@@ -677,12 +824,29 @@ def forward_project_helical_3d(
                 "but torch.cuda.is_available() is False (no silent fallback)."
             )
         device = torch.device("cuda" if backend_norm == "torch_cuda" else "cpu")
+        if view_batch is not None:
+            vb = max(1, int(view_batch))
+        elif device.type == "cuda":
+            vram_bytes = torch.cuda.get_device_properties(device).total_memory
+            samples_per_view = geometry.n_rows * geometry.n_cols * n_steps
+            if vram_bytes >= 60 * (1024**3) and samples_per_view <= 35_000_000:
+                vb = 24
+            elif vram_bytes >= 22 * (1024**3) and samples_per_view <= 35_000_000:
+                vb = 12
+            else:
+                vb = 4
+        else:
+            vb = 2
+
         with torch.no_grad():
             vol_t = torch.as_tensor(vol, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-            t_t = torch.as_tensor(t_samples, dtype=torch.float32, device=device).view(1, 1, -1)
+            t_t = torch.as_tensor(t_samples, dtype=torch.float32, device=device).view(1, 1, 1, -1)
             sx_norm = float(2.0 / max(float(nx - 1), 1.0))
             sy_norm = float(2.0 / max(float(ny - 1), 1.0))
             sz_norm = float(2.0 / max(float(nz - 1), 1.0)) if nz > 1 else 0.0
+            max_nx = float(nx - 1)
+            max_ny = float(ny - 1)
+            max_nz = float(max(nz - 1, 0))
 
             with ProgressReporter(
                 total=geometry.n_views,
@@ -692,40 +856,47 @@ def forward_project_helical_3d(
                 colour="magenta",
                 enabled=show_progress and geometry.n_views > 0,
             ) as bar:
-                for i in range(geometry.n_views):
-                    src, dirs, _ = geometry.ray_origins_and_directions(i)
-                    dirs_t = torch.as_tensor(dirs, dtype=torch.float32, device=device)  # (R, C, 3)
-                    x_pts = float(src[0]) + t_t * dirs_t[:, :, 0:1]  # (R, C, S)
-                    y_pts = float(src[1]) + t_t * dirs_t[:, :, 1:2]
-                    z_pts = float(src[2]) + t_t * dirs_t[:, :, 2:3]
+                for i0 in range(0, geometry.n_views, vb):
+                    i1 = min(geometry.n_views, i0 + vb)
+                    kv = i1 - i0
+                    src, dirs, _ = geometry.ray_origins_and_directions(slice(i0, i1))
+                    src_t = torch.as_tensor(src, dtype=torch.float32, device=device)  # (kv, 3)
+                    dirs_t = torch.as_tensor(dirs, dtype=torch.float32, device=device)  # (kv, R, C, 3)
+                    x_pts = src_t[:, 0].view(kv, 1, 1, 1) + t_t * dirs_t[:, :, :, 0:1]  # (kv, R, C, S)
+                    y_pts = src_t[:, 1].view(kv, 1, 1, 1) + t_t * dirs_t[:, :, :, 1:2]
+                    z_pts = src_t[:, 2].view(kv, 1, 1, 1) + t_t * dirs_t[:, :, :, 2:3]
 
                     cf = (x_pts - x0) * inv_span_x
                     rf = (y_pts - y0) * inv_span_y
                     zf = (z_pts - z0) * inv_span_z if nz > 1 else torch.zeros_like(x_pts)
 
-                    in_xy = (cf >= 0.0) & (cf <= float(nx - 1)) & (rf >= 0.0) & (rf <= float(ny - 1))
+                    in_xy = (cf >= 0.0) & (cf <= max_nx) & (rf >= 0.0) & (rf <= max_ny)
                     if z_boundary_mode == "clamp":
-                        zf_use = torch.clamp(zf, 0.0, float(max(nz - 1, 0)))
+                        zf_use = torch.clamp(zf, 0.0, max_nz)
                         valid_m = in_xy
                     else:
                         zf_use = zf
-                        valid_m = in_xy & (zf >= 0.0) & (zf <= float(max(nz - 1, 0)))
+                        valid_m = in_xy & (zf >= 0.0) & (zf <= max_nz)
 
                     gx = cf * sx_norm - 1.0
                     gy = rf * sy_norm - 1.0
                     gz = (zf_use * sz_norm - 1.0) if nz > 1 else torch.zeros_like(gx)
-                    grid = torch.stack([gx, gy, gz], dim=-1).unsqueeze(0)  # (1, R, C, S, 3)
+                    grid = torch.stack([gx, gy, gz], dim=-1).view(
+                        1, kv * geometry.n_rows, geometry.n_cols, n_steps, 3
+                    )
                     sampled = F.grid_sample(
                         vol_t,
                         grid,
                         mode="bilinear",
                         padding_mode="zeros",
                         align_corners=True,
-                    ).squeeze(0).squeeze(0)  # (R, C, S)
+                    ).view(kv, geometry.n_rows, geometry.n_cols, n_steps)
                     sampled = torch.where(valid_m, sampled, torch.zeros_like(sampled))
-                    proj_i = torch.sum(sampled, dim=2) * float(dt)
-                    projections[i] = proj_i.detach().cpu().numpy().astype(np.float32)
-                    bar.update(1)
+                    proj_kv = torch.sum(sampled, dim=3) * float(dt)
+                    projections[i0:i1] = proj_kv.detach().cpu().numpy().astype(np.float32)
+                    bar.update(kv)
+                    if progress_callback is not None:
+                        progress_callback(i1, geometry.n_views)
         return projections
 
     # Pure NumPy vectorized per-view implementation
@@ -798,6 +969,8 @@ def forward_project_helical_3d(
             vals = np.where(valid, vals, np.float32(0.0))
             projections[i] = np.sum(vals, axis=2, dtype=np.float32) * np.float32(dt)
             bar.update(1)
+            if progress_callback is not None:
+                progress_callback(i + 1, geometry.n_views)
 
     return projections
 
@@ -821,7 +994,7 @@ def _blend_data_consistent_reprojected_sinogram(
     if not np.any(unmeasured):
         return out.astype(np.float32)
 
-    n_slices, n_beta, n_u = out.shape
+    n_slices, _, _ = out.shape
     for s_idx in range(n_slices):
         um = unmeasured[s_idx]
         if not np.any(um):
@@ -841,26 +1014,16 @@ def _blend_data_consistent_reprojected_sinogram(
                 cur[nb_mask, m_un] = cur[nb_mask, nearest_m]
                 cur_mask[nb_mask, m_un] = True
 
-        # Step 1: Anchor reprojected wedge to measured boundary values along angle beta:
+        # Step 1: Vectorized boundary-anchored reprojection along angle beta:
         # s_corr(beta, u) = s_reproj(beta, u) + interp_beta[s_raw - s_reproj](beta, u)
-        for m_idx in range(n_u):
-            col_m = cur_mask[:, m_idx]
-            if np.all(col_m) or not np.any(col_m):
-                continue
-            valid_k = np.where(col_m)[0]
-            miss_k = np.where(~col_m)[0]
-            diff_valid = cur[valid_k, m_idx] - rep_s[valid_k, m_idx]
-            diff_interp = np.interp(
-                miss_k.astype(np.float64),
-                valid_k.astype(np.float64),
-                diff_valid,
-            )
-            reproj_anchored = np.maximum(0.0, rep_s[miss_k, m_idx] + diff_interp)
+        diff_interp_2d, col_filled = _interp_columns_linear_2d(cur - rep_s, cur_mask)
+        if np.any(col_filled):
+            reproj_anchored = np.maximum(0.0, rep_s + diff_interp_2d)
             if ext is not None:
-                ext_vals = ext[s_idx, miss_k, m_idx].astype(np.float64)
-                cur[miss_k, m_idx] = 0.5 * reproj_anchored + 0.5 * ext_vals
+                blended = 0.5 * reproj_anchored + 0.5 * ext[s_idx].astype(np.float64)
             else:
-                cur[miss_k, m_idx] = reproj_anchored
+                blended = reproj_anchored
+            cur = np.where(col_filled, blended, cur)
 
         for _ in range(max(0, int(feather_passes))):
             pad_u = np.pad(cur, ((0, 0), (1, 1)), mode="edge")

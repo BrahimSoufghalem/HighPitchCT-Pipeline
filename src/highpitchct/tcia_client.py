@@ -199,24 +199,52 @@ def discover_tcia_series(
     base_url: str = DEFAULT_BASE_URL,
     timeout: int = 120,
 ) -> list[SeriesSpec]:
-    """Query NBIA public API and build deterministic SeriesSpec entries grouped by patient."""
-    wanted_roles = roles or {"projection_full", "reconstruction_published"}
-    url = collection_series_url(collection=collection, body_part=body_part, base_url=base_url)
-    records = _get_json(url, timeout=timeout)
+    """Query NBIA public API and build deterministic SeriesSpec entries grouped by patient.
 
+    Supports single `body_part` (e.g. `'CHEST'`), comma-separated multi-region filters
+    (e.g. `'CHEST,ABDOMEN'`), or `'ALL'` / `None` for all available regions.
+    """
+    wanted_roles = roles or {"projection_full", "reconstruction_published"}
+    bp_tokens: list[str] = []
+    if body_part:
+        for tok in str(body_part).split(","):
+            t = tok.strip().upper()
+            if t and t != "ALL" and t not in bp_tokens:
+                bp_tokens.append(t)
+
+    records: list[dict] = []
+    if len(bp_tokens) == 1:
+        url = collection_series_url(collection=collection, body_part=bp_tokens[0], base_url=base_url)
+        records = _get_json(url, timeout=timeout)
+    elif len(bp_tokens) > 1:
+        seen_uids_raw: set[str] = set()
+        for bp_tok in bp_tokens:
+            url = collection_series_url(collection=collection, body_part=bp_tok, base_url=base_url)
+            for rec in _get_json(url, timeout=timeout):
+                uid_r = str(rec.get("SeriesInstanceUID") or "").strip()
+                if uid_r and uid_r not in seen_uids_raw:
+                    seen_uids_raw.add(uid_r)
+                    records.append(rec)
+    else:
+        url = collection_series_url(collection=collection, body_part=None, base_url=base_url)
+        records = _get_json(url, timeout=timeout)
+
+    allowed_bp = set(bp_tokens)
     by_patient: dict[str, list[SeriesSpec]] = {}
+    seen_uids: set[str] = set()
     for rec in records:
         uid = str(rec.get("SeriesInstanceUID") or "").strip()
         patient_id = str(rec.get("PatientID") or "").strip()
-        if not uid or not patient_id:
+        if not uid or not patient_id or uid in seen_uids:
             continue
         desc = str(rec.get("SeriesDescription") or "").strip()
         role = classify_tcia_series_role(desc, str(rec.get("Modality") or "CT"))
         if role not in wanted_roles:
             continue
         bp = str(rec.get("BodyPartExamined") or "").strip().upper()
-        if body_part and bp and bp != body_part.strip().upper():
+        if allowed_bp and bp and bp not in allowed_bp:
             continue
+        seen_uids.add(uid)
 
         raw_count = rec.get("ImageCount")
         raw_bytes = rec.get("FileSize") or rec.get("TotalSizeInBytes")
@@ -234,6 +262,13 @@ def discover_tcia_series(
             body_part=bp,
         )
         by_patient.setdefault(case_id, []).append(spec)
+
+    if "projection_full" in wanted_roles:
+        by_patient = {
+            cid: slist
+            for cid, slist in by_patient.items()
+            if any(s.role == "projection_full" for s in slist)
+        }
 
     sorted_cases = sorted(by_patient.keys())
     if max_cases is not None:
