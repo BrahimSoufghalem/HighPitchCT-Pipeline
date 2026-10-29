@@ -173,22 +173,22 @@ class TestStage5DualDomainDL(unittest.TestCase):
         self.assertAlmostEqual(float(s_dc[0, 0, 2]), 1.65, places=6)
         self.assertEqual(float(s_dc[0, 0, 3]), 0.0)  # negative prediction clamped to 0.0
 
-        # 3. Activated 4-channel image conditioning tensor (+ backward-compatible 3-channel mode)
+        # 3. 3-channel and activated 4-channel image conditioning tensors
         x_dc_hu = torch.zeros((1, 8, 8), dtype=torch.float32)
         x_pre_hu = torch.full((1, 8, 8), -200.0, dtype=torch.float32)
         fov_mask = torch.ones((1, 8, 8), dtype=torch.bool)
         fov_mask[0, 0, 0] = False
         x_img = build_image_input_tensor(x_dc_hu, x_pre_hu, fov_mask, effective_pitch=2.5)
-        self.assertEqual(tuple(x_img.shape), (1, 4, 8, 8))
+        self.assertEqual(tuple(x_img.shape), (1, 3, 8, 8))
         self.assertEqual(float(x_img[0, 0, 0, 0]), 0.0)
         self.assertEqual(float(x_img[0, 2, 0, 0]), 0.0)
-        self.assertEqual(float(x_img[0, 3, 0, 0]), 0.0)
         self.assertAlmostEqual(float(x_img[0, 2, 4, 4]), 2.5 / 3.0, places=5)
-        self.assertAlmostEqual(float(x_img[0, 3, 4, 4]), 1.0, places=5)
-        x_img_legacy = build_image_input_tensor(
-            x_dc_hu, x_pre_hu, fov_mask, effective_pitch=2.5, include_diff_channel=False
+        x_img_4ch = build_image_input_tensor(
+            x_dc_hu, x_pre_hu, fov_mask, effective_pitch=2.5, in_channels=4
         )
-        self.assertEqual(tuple(x_img_legacy.shape), (1, 3, 8, 8))
+        self.assertEqual(tuple(x_img_4ch.shape), (1, 4, 8, 8))
+        self.assertEqual(float(x_img_4ch[0, 3, 0, 0]), 0.0)
+        self.assertAlmostEqual(float(x_img_4ch[0, 3, 4, 4]), 1.0, places=5)
 
         # 4. Verify 4-level (64 -> 128 -> 256 -> 512 -> 512 -> 256 -> 128 -> 64) Fig. 3 U-Net topology
         full_model, _ = create_dual_domain_model(backend="torch", seed=42)
