@@ -534,6 +534,14 @@ def _reconstruct_high_pitch_arrays_chunked(
                 backend=backend,
                 show_progress=False,
             )
+        del fbp_pre, mu_pre_pos, s_rep, sub_hp
+        if backend in {"torch", "torch_cuda"}:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
         if progress_cb is not None:
             progress_cb(s1, n_slices)
 
@@ -715,6 +723,14 @@ def build_patient_full_volume_shard(
                 f"DICOM + GPU Curved->Flat views {v1}/{n_views} ({frac_v*100.0:.0f}%)",
             )
 
+    if sim_backend in {"torch", "torch_cuda"}:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     # 2. Full-volume Reference SSRB + Batched GPU FBP on z_slab (22% -> 38%)
     _emit_step(24.0, f"Reference SSRB across {z_slab.size} axial slices (usable={n_req}, dz={dz_mm:.2f} mm)...")
     ssrb_slab = rebin_helical_ssrb(
@@ -736,7 +752,17 @@ def build_patient_full_volume_shard(
     y_mm_ref: np.ndarray | None = None
     x_mm_ref: np.ndarray | None = None
     fov_mask_ref: np.ndarray | None = None
-    fbp_chunk = 64
+
+    vram_gb_avail = 0.0
+    if sim_backend in {"torch", "torch_cuda"}:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_gb_avail = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        except Exception:
+            pass
+    fbp_chunk = 48 if vram_gb_avail >= 70.0 else (32 if vram_gb_avail >= 35.0 else 16)
+
     for s0 in range(0, n_slab, fbp_chunk):
         s1 = min(n_slab, s0 + fbp_chunk)
         fbp_part = reconstruct_fanbeam_fbp(
@@ -828,7 +854,7 @@ def build_patient_full_volume_shard(
                 cutoff_ratio=cutoff_ratio,
                 inpaint_mode=inpaint_mode,
                 backend=sim_backend,
-                slice_chunk=64,
+                slice_chunk=fbp_chunk,
                 progress_cb=lambda done, tot, _pb=p_base, _ps=p_span, _pt=p_target: _emit_step(
                     _pb + _ps * (0.20 + 0.80 * float(done) / float(max(tot, 1))),
                     f"RDC p={_pt:.1f}: Prelim FBP + 2D Reproj {done}/{tot} slices ({100.0*done/max(tot,1):.0f}%)",

@@ -841,8 +841,31 @@ def _reconstruct_fanbeam_fbp_batched_torch(
         left_taper_np = np.zeros(0, dtype=np.float32)
         right_taper_np = np.zeros(0, dtype=np.float32)
 
-    slice_batch = (32 if n_pix <= 70000 else 12) if require_cuda else 4
-    step = max(16, min(max(int(angle_chunk), 64), 64 if n_pix > 70000 else 192))
+    if require_cuda:
+        try:
+            vram_bytes = torch.cuda.get_device_properties(device).total_memory
+        except Exception:
+            vram_bytes = 14 * (1024**3)
+        if vram_bytes >= 70 * (1024**3):
+            # A100 (80GB) or RTX PRO 6000 (96GB)
+            slice_batch = 24 if n_pix <= 70000 else 12
+            step = 128 if n_pix <= 70000 else 64
+        elif vram_bytes >= 35 * (1024**3):
+            # A6000 (48GB) or A40 (48GB)
+            slice_batch = 16 if n_pix <= 70000 else 8
+            step = 96 if n_pix <= 70000 else 64
+        elif vram_bytes >= 20 * (1024**3):
+            # RTX 3090 / 4090 (24GB)
+            slice_batch = 12 if n_pix <= 70000 else 6
+            step = 64
+        else:
+            # Tesla T4 (15GB on Kaggle), RTX 3080/4070 (10-12GB)
+            slice_batch = 8 if n_pix <= 70000 else 4
+            step = 48 if n_pix <= 70000 else 32
+        torch.cuda.empty_cache()
+    else:
+        slice_batch = 4
+        step = max(16, min(max(int(angle_chunk), 32), 64))
 
     # Parker weights depend only on relative angle b_tilde = beta - beta[0]; reuse when uniform across slices!
     beta_f64 = np.asarray(beta_rad, dtype=np.float64)
@@ -951,9 +974,13 @@ def _reconstruct_fanbeam_fbp_batched_torch(
 
                 inv_u = rho0_f * inv_d_ray
                 acc += torch.sum(q_interp * (inv_u * inv_u), dim=1)
+                del sin_b, cos_b, d_ray, inv_d_ray, u_perp, m_star, in_det, m_cl, m0, m1, wm, v0, v1, q_interp, inv_u
 
             acc *= d_beta_b
             mu_slices[s0:s1, fov_iy, fov_ix] = acc.detach().cpu().numpy().astype(np.float32)
+            del q_b, q_full, g_ext, g_w, sino_b, beta_b, d_beta_b, acc
+            if require_cuda:
+                torch.cuda.empty_cache()
             if progress_bar is not None:
                 progress_bar.update(bsz)
 
