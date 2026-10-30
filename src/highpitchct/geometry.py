@@ -196,8 +196,13 @@ class HelicalGeometry:
         return (float(self.center_col_0based) + 1.0, float(self.center_row_0based) + 1.0)
 
     @property
+    def dv_iso_mm(self) -> float:
+        """Detector row pitch projected to scanner isocenter [mm]."""
+        return float(self.dv_mm) * (float(self.rho0_mm) / float(self.d0_mm))
+
+    @property
     def coverage_isocenter_mm(self) -> float:
-        return float(self.n_rows) * float(self.dv_mm) * (float(self.rho0_mm) / float(self.d0_mm))
+        return float(self.n_rows) * self.dv_iso_mm
 
     def trajectory_metrics(self) -> dict[str, float | int]:
         return fit_helical_trajectory(

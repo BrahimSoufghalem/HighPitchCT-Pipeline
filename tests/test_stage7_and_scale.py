@@ -21,7 +21,12 @@ from highpitchct.dual_domain_dl import (
     save_dual_domain_checkpoint,
 )
 from highpitchct.forward_project import forward_project_fanbeam_2d
-from highpitchct.phantom import build_thorax_phantom, make_synthetic_helical_geometry
+from highpitchct.phantom import (
+    build_thorax_phantom,
+    make_synthetic_helical_geometry,
+    project_phantom_helical,
+    write_synthetic_ctpd_series,
+)
 from highpitchct.rebinning import rebin_curved_to_flat, rebin_helical_ssrb
 from highpitchct.recon_fbp import (
     compute_batch_reconstruction_metrics_torch,
@@ -30,6 +35,8 @@ from highpitchct.recon_fbp import (
 )
 from highpitchct.scale_pipeline import (
     ShardedDualDomainDataset,
+    build_cohort_shards_resumable,
+    build_patient_full_volume_shard,
     build_synthetic_cohort_shards,
     compute_patient_full_slice_grid,
     plan_three_way_patient_split,
@@ -349,6 +356,57 @@ class TestStage7AndWorkstationScale(unittest.TestCase):
             self.assertGreaterEqual(len(rows), 6)
             saved_json = json.loads(json_p.read_text(encoding="utf-8"))
             self.assertEqual(saved_json["test_sample_count"], 4)
+
+    def test_build_patient_full_volume_shard_from_dicom_with_oversampling_guard(self) -> None:
+        """Verify real DICOM shard construction: zero crash at line 737 and physical slice clamping."""
+        geom = make_synthetic_helical_geometry(
+            n_views=256,
+            n_rows=16,
+            n_cols=96,
+            angular_steps_per_rotation=128,
+            normalized_pitch=0.85,
+            dv_mm=1.5,
+        )
+        phantom = build_thorax_phantom(axial_scale=0.4)
+        proj = project_phantom_helical(phantom, geom, batch_views=64)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proj_dir = (
+                root / "raw" / "tcia" / "case_TEST01" / "projection_full" / geom.series_instance_uid
+            )
+            shard_dir = root / "shards" / "train" / "case_TEST01"
+
+            write_synthetic_ctpd_series(proj_dir, geom, proj, patient_id="TEST01")
+
+            info = build_patient_full_volume_shard(
+                "case_TEST01",
+                proj_dir,
+                shard_dir,
+                split_name="train",
+                target_slices_per_patient=2500,
+                pitches=[1.5],
+                scenarios=["rdc"],
+                image_size=32,
+                backend="numpy",
+                workers=2,
+            )
+
+            self.assertFalse(info["resumed_from_disk"])
+            # Verify slice count was clamped to scanner physical thin-slice capacity (dz >= 0.45 mm)
+            self.assertLess(info["num_slices"], 100)
+            self.assertGreaterEqual(info["slice_spacing_mm"], 0.45)
+            self.assertTrue(Path(info["shard_dir"]).is_dir())
+            self.assertTrue((shard_dir / "shard_complete.json").is_file())
+            self.assertTrue((shard_dir / "s_target.npy").is_file())
+            self.assertTrue((shard_dir / "x_target_hu.npy").is_file())
+
+            # Verify ShardedDualDomainDataset loads this shard without issues
+            ds = ShardedDualDomainDataset([shard_dir], seed=42)
+            self.assertEqual(len(ds), info["num_samples"])
+            sample = ds[0]
+            self.assertEqual(sample["x_target_hu"].shape, (32, 32))
+            self.assertEqual(sample["s_hp_raw"].shape, sample["s_target"].shape)
 
 
 if __name__ == "__main__":

@@ -344,14 +344,29 @@ def compute_patient_full_slice_grid(
         z_mid = 0.5 * (z_min_raw + z_max_raw)
         return np.array([z_mid], dtype=np.float64), 1.25
 
+    # Clinical detector thin-slice limit: dz should not drop below physical scanner resolution
+    # (~0.45 to 0.8 mm) to avoid redundant 10x-oversampling duplicate slices.
+    dv_iso = float(
+        getattr(
+            geometry,
+            "dv_iso_mm",
+            float(geometry.dv_mm) * (float(geometry.rho0_mm) / float(geometry.d0_mm)),
+        )
+    )
+    default_dz = max(0.8, min(1.25, dv_iso * 2.0))
+    min_physical_dz = max(0.4, min(1.0, dv_iso * 0.75))
+
     if target_slices_per_patient is not None and int(target_slices_per_patient) >= 2:
         n_slices = int(target_slices_per_patient)
+        # Cap to physical scanner thin-slice capacity unless user explicitly requested spacing
+        max_physical_slices = max(2, int(math.floor(usable_span / min_physical_dz)) + 1)
+        if n_slices > max_physical_slices:
+            n_slices = max_physical_slices
     elif slice_spacing_mm is not None and float(slice_spacing_mm) > 0.0:
         n_slices = max(2, int(round(usable_span / float(slice_spacing_mm))) + 1)
     else:
         # Default clinical thin-slice spacing (~1.25 mm -> ~235-250 full-volume slices/patient,
         # yielding ~50,000 samples across 35 patients × 6 high-pitch scenarios!)
-        default_dz = max(0.8, min(1.25, float(geometry.dv_iso_mm) * 2.0))
         n_slices = max(2, int(round(usable_span / default_dz)) + 1)
 
     if max_slices_per_patient is not None and int(max_slices_per_patient) >= 1:
@@ -702,6 +717,10 @@ def build_patient_full_volume_shard(
     n_slab = int(z_slab.size)
     mu_slab = np.empty((n_slab, image_size, image_size), dtype=np.float32)
     hu_slab = np.empty((n_slab, image_size, image_size), dtype=np.float32)
+    s_target_slab = np.empty(
+        (n_slab, ssrb_slab.sinograms.shape[1], ssrb_slab.sinograms.shape[2]),
+        dtype=np.float32,
+    )
     y_mm_ref: np.ndarray | None = None
     x_mm_ref: np.ndarray | None = None
     fov_mask_ref: np.ndarray | None = None
@@ -721,6 +740,14 @@ def build_patient_full_volume_shard(
         )
         mu_slab[s0:s1] = fbp_part.mu_slices
         hu_slab[s0:s1] = fbp_part.hu_slices
+        if fbp_part.extrapolated_sinograms is not None:
+            s_target_slab[s0:s1] = fbp_part.extrapolated_sinograms
+        else:
+            s_target_slab[s0:s1] = extrapolate_sinogram(
+                _slice_ssrb_result(ssrb_slab, s0, s1),
+                inpaint_mode="conjugate_feather",
+                workers=max(1, workers),
+            ).completed_sinograms
         if y_mm_ref is None:
             y_mm_ref = fbp_part.y_mm.copy()
             x_mm_ref = fbp_part.x_mm.copy()
@@ -734,16 +761,8 @@ def build_patient_full_volume_shard(
     ssrb_ref_rdc = _slice_ssrb_result(ssrb_slab, req_i0, req_i1)
     x_target_rdc = hu_slab[req_i0:req_i1].copy()
     mu_target_rdc = mu_slab[req_i0:req_i1].copy()
-    s_target_rdc = extrapolate_sinogram(
-        ssrb_ref_rdc.sinograms,
-        ssrb_ref_rdc.measured_mask,
-        mode="conjugate_feather",
-        beta_rad=ssrb_ref_rdc.beta_rad,
-        u_coords_mm=ssrb_ref_rdc.u_coords_mm,
-        d0_mm=ssrb_ref_rdc.d0_mm,
-        workers=max(1, workers),
-    )
-    del ssrb_slab
+    s_target_rdc = s_target_slab[req_i0:req_i1].copy()
+    del ssrb_slab, s_target_slab
 
     # Containers to stack all scenario × pitch blocks cleanly
     scen_order: list[str] = []
@@ -881,9 +900,14 @@ def build_patient_full_volume_shard(
                 backend=sim_backend,
                 show_progress=False,
             )
-            x_target_itf[s0:s1] = fbp_itf_part.hu_slices
-            mu_target_itf[s0:s1] = fbp_itf_part.mu_slices
-            s_target_itf[s0:s1] = fbp_itf_part.extrapolated_sinograms
+            if fbp_itf_part.extrapolated_sinograms is not None:
+                s_target_itf[s0:s1] = fbp_itf_part.extrapolated_sinograms
+            else:
+                s_target_itf[s0:s1] = extrapolate_sinogram(
+                    _slice_ssrb_result(ssrb_ref_itf, s0, s1),
+                    inpaint_mode="conjugate_feather",
+                    workers=max(1, workers),
+                ).completed_sinograms
 
         itf_scen_idx = len(scen_order)
         scen_order.append("itf")
@@ -1247,9 +1271,19 @@ def build_cohort_shards_resumable(
         and target_total_samples is not None
         and int(target_total_samples) > 0
     ):
-        target_slices_per_pat = max(
+        raw_target_slices = max(
             2, int(round(float(target_total_samples) / float(n_patients_total * n_combos)))
         )
+        # Cap target_slices_per_pat to physical detector thin-slice limit (~320 slices/patient for ~350 mm scan)
+        # to prevent redundant sub-millimeter axial oversampling when small test cohorts (e.g. 3 patients) are run
+        target_slices_per_pat = min(raw_target_slices, 320)
+        if raw_target_slices > 320 and show_progress:
+            print(
+                f"[build_cohort_shards_resumable] Note: target_slices_per_patient calculated as {raw_target_slices} "
+                f"from target_total_samples={target_total_samples} across {n_patients_total} patients. "
+                f"Capped at {target_slices_per_pat} slices/patient to match physical detector thin-slice resolution "
+                f"(preventing redundant sub-millimeter axial oversampling)."
+            )
 
     root = Path(shards_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,7 @@ class FBPReconstructionResult:
     angular_mode: str
     backend: str
     sinogram_prep_summary: dict[str, Any]
+    extrapolated_sinograms: np.ndarray | None = None
 
     @property
     def n_slices(self) -> int:
@@ -284,6 +286,10 @@ def extrapolate_sinogram(
                 cur_mask[nb_mask, m_un] = True
                 interp_filled[s_idx, nb_mask, m_un] = True
 
+        if np.all(cur_mask):
+            completed[s_idx] = np.maximum(cur_sino, 0.0).astype(np.float32)
+            return
+
         # Step 1: Exact 2D fan-beam conjugate-ray fill (beta' = beta + 2*alpha +/- pi, u' = -u)
         if mode == "conjugate_feather" and n_beta >= 2:
             miss_k, miss_m = np.where(~cur_mask)
@@ -403,15 +409,16 @@ def extrapolate_sinogram(
         # Step 4: Feather transitions across all unmeasured pixels (~mask_orig[s_idx]) along (u, k)
         # while keeping every originally measured pixel (mask_orig[s_idx]) 100% untouched and exact.
         unmeas_s = ~mask_orig[s_idx]
+        cur_f32 = cur_sino.astype(np.float32)
         if np.any(unmeas_s) and n_u >= 3 and n_beta >= 3:
             for _ in range(6):
-                pad_u = np.pad(cur_sino, ((0, 0), (1, 1)), mode="edge")
-                smooth_u = 0.25 * pad_u[:, :-2] + 0.50 * pad_u[:, 1:-1] + 0.25 * pad_u[:, 2:]
+                pad_u = np.pad(cur_f32, ((0, 0), (1, 1)), mode="edge")
+                smooth_u = np.float32(0.25) * pad_u[:, :-2] + np.float32(0.50) * pad_u[:, 1:-1] + np.float32(0.25) * pad_u[:, 2:]
                 pad_k = np.pad(smooth_u, ((1, 1), (0, 0)), mode="edge")
-                smooth_ku = 0.25 * pad_k[:-2, :] + 0.50 * pad_k[1:-1] + 0.25 * pad_k[2:, :]
-                cur_sino = np.where(unmeas_s, smooth_ku, cur_sino)
+                smooth_ku = np.float32(0.25) * pad_k[:-2, :] + np.float32(0.50) * pad_k[1:-1, :] + np.float32(0.25) * pad_k[2:, :]
+                cur_f32 = np.where(unmeas_s, smooth_ku, cur_f32)
 
-        completed[s_idx] = np.maximum(cur_sino, 0.0).astype(np.float32)
+        completed[s_idx] = np.maximum(cur_f32, np.float32(0.0))
 
     n_workers = max(1, int(workers))
     if n_workers > 1 and n_slices >= 4:
@@ -834,8 +841,23 @@ def _reconstruct_fanbeam_fbp_batched_torch(
         left_taper_np = np.zeros(0, dtype=np.float32)
         right_taper_np = np.zeros(0, dtype=np.float32)
 
-    slice_batch = (16 if n_pix <= 70000 else 8) if require_cuda else 4
-    step = max(16, min(max(int(angle_chunk), 64), 64 if n_pix > 70000 else 128))
+    slice_batch = (32 if n_pix <= 70000 else 12) if require_cuda else 4
+    step = max(16, min(max(int(angle_chunk), 64), 64 if n_pix > 70000 else 192))
+
+    # Parker weights depend only on relative angle b_tilde = beta - beta[0]; reuse when uniform across slices!
+    beta_f64 = np.asarray(beta_rad, dtype=np.float64)
+    b_tilde_all = beta_f64 - beta_f64[:, 0:1]
+    shared_parker = bool(n_slices == 1 or np.allclose(b_tilde_all, b_tilde_all[0:1], atol=1e-7))
+    w_red_shared_np = (
+        compute_parker_weights(
+            beta_f64[0],
+            u_coords,
+            d0_mm,
+            angular_mode=angular_mode,
+        ).astype(np.float32)
+        if shared_parker
+        else None
+    )
 
     with torch.no_grad():
         h_t = torch.as_tensor(h_rfft, dtype=torch.float32, device=device).view(1, 1, -1)
@@ -844,6 +866,11 @@ def _reconstruct_fanbeam_fbp_batched_torch(
         cos_t = torch.as_tensor(np.ascontiguousarray(cos_alpha, dtype=np.float32), device=device).view(1, 1, -1)
         left_t = torch.as_tensor(left_taper_np, dtype=torch.float32, device=device).view(1, 1, -1)
         right_t = torch.as_tensor(right_taper_np, dtype=torch.float32, device=device).view(1, 1, -1)
+        w_red_shared_t = (
+            torch.as_tensor(w_red_shared_np, dtype=torch.float32, device=device).unsqueeze(0)
+            if w_red_shared_np is not None
+            else None
+        )
 
         rho0_f = float(rho0_mm)
         d0_over_du_f = float(d0_mm / du_mm)
@@ -853,21 +880,26 @@ def _reconstruct_fanbeam_fbp_batched_torch(
         for s0 in range(0, n_slices, slice_batch):
             s1 = min(n_slices, s0 + slice_batch)
             bsz = s1 - s0
-            w_red_np = np.stack(
-                [
-                    compute_parker_weights(
-                        np.asarray(beta_rad[s], dtype=np.float64),
-                        u_coords,
-                        d0_mm,
-                        angular_mode=angular_mode,
-                    ).astype(np.float32)
-                    for s in range(s0, s1)
-                ],
-                axis=0,
-            )
+            if w_red_shared_t is not None:
+                w_red_b = w_red_shared_t
+            else:
+                w_red_np = np.stack(
+                    [
+                        compute_parker_weights(
+                            beta_f64[s],
+                            u_coords,
+                            d0_mm,
+                            angular_mode=angular_mode,
+                        ).astype(np.float32)
+                        for s in range(s0, s1)
+                    ],
+                    axis=0,
+                )
+                w_red_b = torch.as_tensor(w_red_np, dtype=torch.float32, device=device)
+
             d_beta_np = np.asarray(
                 [
-                    _quadrature_d_beta(np.asarray(beta_rad[s], dtype=np.float64), angular_mode)
+                    _quadrature_d_beta(beta_f64[s], angular_mode)
                     for s in range(s0, s1)
                 ],
                 dtype=np.float32,
@@ -876,7 +908,6 @@ def _reconstruct_fanbeam_fbp_batched_torch(
             sino_b = torch.as_tensor(
                 np.ascontiguousarray(completed_sinograms[s0:s1], dtype=np.float32), device=device
             )
-            w_red_b = torch.as_tensor(w_red_np, dtype=torch.float32, device=device)
             beta_b = torch.as_tensor(
                 np.ascontiguousarray(beta_rad[s0:s1], dtype=np.float32), device=device
             )
@@ -992,7 +1023,7 @@ def reconstruct_fanbeam_fbp(
         ssrb_result,
         inpaint_mode=inpaint_mode,
         lateral_pad_cols=lateral_pad_cols,
-        workers=4 if n_slices >= 8 else 1,
+        workers=min(12, os.cpu_count() or 4) if n_slices >= 4 else 1,
     )
 
     mu_slices = np.zeros((n_slices, n_xy, n_xy), dtype=np.float32)
@@ -1112,6 +1143,7 @@ def reconstruct_fanbeam_fbp(
         angular_mode=ssrb_result.angular_mode,
         backend=backend_norm,
         sinogram_prep_summary=prep.summary_dict(),
+        extrapolated_sinograms=prep.completed_sinograms,
     )
 
 
@@ -1233,6 +1265,7 @@ def reconstruct_fanbeam_fbp_scalar_ref(
         angular_mode=ssrb_result.angular_mode,
         backend="scalar_ref",
         sinogram_prep_summary=prep.summary_dict(),
+        extrapolated_sinograms=prep.completed_sinograms,
     )
 
 
