@@ -1,3 +1,3 @@
-"""HighPitchCT research pipeline (v1.0.6 Dual-GPU FBP & safe imports)."""
+"""HighPitchCT research pipeline (v1.0.7 Dual-GPU FBP & CUDA-safe backprojection)."""
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"

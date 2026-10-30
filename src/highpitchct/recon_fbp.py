@@ -42,6 +42,13 @@ try:
 except ImportError:
     torch = None  # type: ignore[assignment]
 
+import threading
+
+# Serializes cuFFT plan creation/execution when several GPU worker threads run FBP concurrently.
+_CUFFT_LOCK = threading.Lock()
+# Set HPCT_FBP_MULTI_GPU=0 to force single-GPU FBP (debug / fallback switch).
+_FBP_MULTI_GPU_ENABLED = os.environ.get("HPCT_FBP_MULTI_GPU", "1").strip() not in {"0", "false", "no"}
+
 from .ctpd_reader import mu_to_hu, scan_projection_series
 from .geometry import HelicalGeometry
 from .progress import ProgressReporter
@@ -938,15 +945,24 @@ def _reconstruct_fanbeam_fbp_batched_torch(
                 dtype=np.float32,
             )
 
-            sino_b = torch.as_tensor(
-                np.ascontiguousarray(completed_sinograms[s0:s1], dtype=np.float32), device=device
+            # Sanitize NaN/Inf on the host: a single NaN beta would turn into a garbage int64
+            # gather index on the GPU and trigger `cudaErrorIllegalAddress`.
+            sino_np = np.nan_to_num(
+                np.ascontiguousarray(completed_sinograms[s0:s1], dtype=np.float32),
+                nan=0.0, posinf=0.0, neginf=0.0,
             )
-            beta_b = torch.as_tensor(
-                np.ascontiguousarray(beta_rad[s0:s1], dtype=np.float32), device=device
-            )
+            beta_np = np.ascontiguousarray(beta_rad[s0:s1], dtype=np.float32)
+            beta_valid_np = np.isfinite(beta_np)
+            beta_np = np.where(beta_valid_np, beta_np, 0.0).astype(np.float32)
+            d_beta_np = np.nan_to_num(d_beta_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+            sino_b = torch.as_tensor(sino_np, device=device)
+            beta_b = torch.as_tensor(beta_np, device=device)
+            beta_ok_b = torch.as_tensor(beta_valid_np, device=device)
             d_beta_b = torch.as_tensor(d_beta_np, dtype=torch.float32, device=device).view(bsz, 1)
 
             g_w = sino_b * w_red_b * cos_t
+            g_w = torch.nan_to_num(g_w, nan=0.0, posinf=0.0, neginf=0.0)
             if pad > 0:
                 left_pad = g_w[:, :, 0:1] * left_t
                 right_pad = g_w[:, :, -1:] * right_t
@@ -954,15 +970,21 @@ def _reconstruct_fanbeam_fbp_batched_torch(
             else:
                 g_ext = g_w
             g_fft_in = F.pad(g_ext, (0, n_fft - g_ext.shape[2]), mode="constant", value=0.0)
-            q_full = torch.fft.irfft(
-                torch.fft.rfft(g_fft_in, n=n_fft, dim=-1) * h_t, n=n_fft, dim=-1
-            )
-            q_b = q_full[:, :, pad : pad + n_u]
+            # cuFFT plan creation is not reliably thread-safe across devices -> serialize it.
+            with _CUFFT_LOCK:
+                q_full = torch.fft.irfft(
+                    torch.fft.rfft(g_fft_in, n=n_fft, dim=-1) * h_t, n=n_fft, dim=-1
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+            q_b = q_full[:, :, pad : pad + n_u].contiguous()
+            del g_fft_in
 
             acc = torch.zeros((bsz, n_pix), dtype=torch.float32, device=device)
             for k0 in range(0, n_beta, step):
                 k1 = min(n_beta, k0 + step)
                 b_sub = beta_b[:, k0:k1]
+                ok_sub = beta_ok_b[:, k0:k1].unsqueeze(2)
                 sin_b = torch.sin(b_sub).unsqueeze(2)
                 cos_b = torch.cos(b_sub).unsqueeze(2)
 
@@ -970,11 +992,13 @@ def _reconstruct_fanbeam_fbp_batched_torch(
                 inv_d_ray = 1.0 / d_ray
                 u_perp = cos_b * x_t + sin_b * y_t
                 m_star = u_perp * inv_d_ray * d0_over_du_f + c_flat_0_f
+                m_star = torch.nan_to_num(m_star, nan=-1.0, posinf=-1.0, neginf=-1.0)
 
-                in_det = (m_star >= 0.0) & (m_star <= max_col_f)
+                in_det = (m_star >= 0.0) & (m_star <= max_col_f) & ok_sub
                 m_cl = torch.clamp(m_star, 0.0, max_col_f)
-                m0 = torch.floor(m_cl).to(torch.long)
-                m1 = torch.clamp(m0 + 1, max=n_u - 1)
+                # Strict [0, n_u-1] bounds on BOTH sides -> gather can never read out of range
+                m0 = torch.clamp(torch.floor(m_cl).to(torch.long), 0, n_u - 1)
+                m1 = torch.clamp(m0 + 1, 0, n_u - 1)
                 wm = m_cl - m0.to(torch.float32)
 
                 q_sub = q_b[:, k0:k1, :]
@@ -984,11 +1008,13 @@ def _reconstruct_fanbeam_fbp_batched_torch(
 
                 inv_u = rho0_f * inv_d_ray
                 acc += torch.sum(q_interp * (inv_u * inv_u), dim=1)
-                del sin_b, cos_b, d_ray, inv_d_ray, u_perp, m_star, in_det, m_cl, m0, m1, wm, v0, v1, q_interp, inv_u
+                del sin_b, cos_b, d_ray, inv_d_ray, u_perp, m_star, in_det, m_cl, m0, m1, wm, v0, v1, q_interp, inv_u, ok_sub
 
             acc *= d_beta_b
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
             mu_slices[s0:s1, fov_iy, fov_ix] = acc.detach().cpu().numpy().astype(np.float32)
-            del q_b, q_full, g_ext, g_w, sino_b, beta_b, d_beta_b, acc
+            del q_b, q_full, g_ext, g_w, sino_b, beta_b, beta_ok_b, d_beta_b, acc
             if require_cuda:
                 torch.cuda.empty_cache()
             if progress_bar is not None:
@@ -1086,7 +1112,7 @@ def reconstruct_fanbeam_fbp(
                 if (torch is not None and backend_norm == "torch_cuda" and torch.cuda.is_available())
                 else 1
             )
-            if torch is not None and num_gpus >= 2 and n_slices >= 4:
+            if torch is not None and _FBP_MULTI_GPU_ENABLED and num_gpus >= 2 and n_slices >= 4:
                 # Parallel multi-GPU reconstruction across all available CUDA devices (e.g. 2x Tesla T4 on Kaggle)
                 from concurrent.futures import ThreadPoolExecutor
 
