@@ -37,6 +37,11 @@ from typing import Any
 
 import numpy as np
 
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
+
 from .ctpd_reader import mu_to_hu, scan_projection_series
 from .geometry import HelicalGeometry
 from .progress import ProgressReporter
@@ -1078,10 +1083,10 @@ def reconstruct_fanbeam_fbp(
         if backend_norm in {"torch", "torch_cuda"} and n_slices > 1:
             num_gpus = (
                 torch.cuda.device_count()
-                if (backend_norm == "torch_cuda" and torch.cuda.is_available())
+                if (torch is not None and backend_norm == "torch_cuda" and torch.cuda.is_available())
                 else 1
             )
-            if num_gpus >= 2 and n_slices >= 4:
+            if torch is not None and num_gpus >= 2 and n_slices >= 4:
                 # Parallel multi-GPU reconstruction across all available CUDA devices (e.g. 2x Tesla T4 on Kaggle)
                 from concurrent.futures import ThreadPoolExecutor
 
