@@ -356,14 +356,26 @@ def compute_patient_full_slice_grid(
     default_dz = max(0.8, min(1.25, dv_iso * 2.0))
     min_physical_dz = max(0.4, min(1.0, dv_iso * 0.75))
 
+    if slice_spacing_mm is not None and float(slice_spacing_mm) > 0.0:
+        step_mm = float(slice_spacing_mm)
+        n_steps = int(math.floor(usable_span / step_mm))
+        if n_steps < 1:
+            return np.array([0.5 * (z_lo + z_hi)], dtype=np.float64), step_mm
+        total_span = float(n_steps) * step_mm
+        offset = 0.5 * (usable_span - total_span)
+        z_start = z_lo + offset
+        z_req = z_start + np.arange(n_steps + 1, dtype=np.float64) * step_mm
+        if max_slices_per_patient is not None and int(max_slices_per_patient) >= 1:
+            z_req = z_req[: int(max_slices_per_patient)]
+        dz_mm = step_mm
+        return z_req, dz_mm
+
     if target_slices_per_patient is not None and int(target_slices_per_patient) >= 2:
         n_slices = int(target_slices_per_patient)
         # Cap to physical scanner thin-slice capacity unless user explicitly requested spacing
         max_physical_slices = max(2, int(math.floor(usable_span / min_physical_dz)) + 1)
         if n_slices > max_physical_slices:
             n_slices = max_physical_slices
-    elif slice_spacing_mm is not None and float(slice_spacing_mm) > 0.0:
-        n_slices = max(2, int(round(usable_span / float(slice_spacing_mm))) + 1)
     else:
         # Default clinical thin-slice spacing (~1.25 mm -> ~235-250 full-volume slices/patient,
         # yielding ~50,000 samples across 35 patients × 6 high-pitch scenarios!)

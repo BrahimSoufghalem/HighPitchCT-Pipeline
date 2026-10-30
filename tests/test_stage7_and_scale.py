@@ -91,6 +91,11 @@ class TestStage7AndWorkstationScale(unittest.TestCase):
         diffs = np.diff(z_req)
         self.assertLess(float(np.max(np.abs(diffs - dz))), 1e-8)
 
+        # Test exact fixed 1.5 mm spacing
+        z_exact, dz_exact = compute_patient_full_slice_grid(geom, slice_spacing_mm=1.5)
+        self.assertEqual(dz_exact, 1.5)
+        self.assertTrue(np.allclose(np.diff(z_exact), 1.5, atol=1e-10))
+
     def test_activated_4channel_imgnet_and_checkpoint_roundtrip(self) -> None:
         h, w = 48, 48
         x_dc = torch.linspace(-800.0, 300.0, h * w, dtype=torch.float32).reshape(2, h // 2, w)
