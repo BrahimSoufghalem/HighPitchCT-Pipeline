@@ -1713,6 +1713,8 @@ def _parser() -> argparse.ArgumentParser:
     scale.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto")
     scale.add_argument("--workers", type=int, default=8, help="Parallel CPU workers for DICOM/SSRB")
     scale.add_argument("--num-loader-workers", type=int, default=4, help="PyTorch DataLoader worker processes")
+    scale.add_argument("--device", default="cuda", help="Execution device (e.g. cuda, cpu; mapped to backend torch_cuda/torch)")
+    scale.add_argument("--eval-every", type=int, default=1, help="Validation frequency in epochs (default: 1)")
     scale.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -1739,6 +1741,7 @@ def _parser() -> argparse.ArgumentParser:
     stage7.add_argument("--batch-size", type=int, default=16)
     stage7.add_argument("--lr", type=float, default=1.5e-3)
     stage7.add_argument("--backend", choices=["torch", "torch_cuda"], default="torch_cuda")
+    stage7.add_argument("--device", default="cuda", help="Execution device (e.g. cuda, cpu)")
     stage7.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto")
     stage7.add_argument("--num-loader-workers", type=int, default=4)
     stage7.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -3129,6 +3132,11 @@ def main(argv: list[str] | None = None) -> int:
             else (env_prof.data_root / "checkpoints" / "scale_v1")
         )
         fname = normalize_filter_name(args.filter_name)
+        backend_choice = (
+            "torch"
+            if getattr(args, "device", "cuda") == "cpu"
+            else args.backend
+        )
         pitch_list = [float(p.strip()) for p in str(args.pitches).split(",") if p.strip()]
         scenarios_list = (
             ["itf", "rdc"] if args.scenario == "both" else [args.scenario.strip().lower()]
@@ -3174,7 +3182,7 @@ def main(argv: list[str] | None = None) -> int:
                 filter_name=fname,
                 cutoff_ratio=float(args.cutoff_ratio),
                 inpaint_mode=args.inpaint_mode,
-                backend=args.backend,
+                backend=backend_choice,
                 workers=max(1, int(args.workers)),
                 seed=int(args.seed),
                 force_rebuild=bool(args.force_rebuild_shards),
@@ -3190,7 +3198,7 @@ def main(argv: list[str] | None = None) -> int:
                 image_size=min(128, int(args.image_size)),
                 pitches=pitch_list[:2] if len(pitch_list) >= 2 else pitch_list,
                 scenarios=scenarios_list,
-                backend=args.backend,
+                backend=backend_choice,
             )
         else:
             raise SystemExit(
@@ -3222,7 +3230,7 @@ def main(argv: list[str] | None = None) -> int:
             img_in_channels=int(args.img_in_channels),
             filter_name=fname,
             cutoff_ratio=float(args.cutoff_ratio),
-            backend=args.backend,
+            backend=backend_choice,
             amp_mode=args.amp,
             num_workers=int(args.num_loader_workers),
             resume=bool(args.resume),
@@ -3242,7 +3250,7 @@ def main(argv: list[str] | None = None) -> int:
                 m3_epochs=int(args.m3_epochs),
                 batch_size=int(args.batch_size),
                 lr=float(args.lr),
-                backend=args.backend,
+                backend=backend_choice,
                 amp_mode=args.amp,
                 num_workers=int(args.num_loader_workers),
                 resume=bool(args.resume),
