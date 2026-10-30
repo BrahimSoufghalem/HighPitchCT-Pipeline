@@ -1,3 +1,3 @@
-"""HighPitchCT research pipeline (v1.0.3 Adaptive VRAM & 1.5mm Strict Spacing)."""
+"""HighPitchCT research pipeline (v1.0.4 Dual-GPU FBP & Ultra-Safe Memory)."""
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"

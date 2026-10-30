@@ -797,7 +797,8 @@ def _reconstruct_fanbeam_fbp_batched_torch(
     fov_ix: np.ndarray,
     n_xy: int,
     require_cuda: bool,
-    angle_chunk: int = 128,
+    target_device: Any | None = None,
+    angle_chunk: int = 64,
     progress_bar: Any = None,
 ) -> np.ndarray:
     """Batched multi-slice PyTorch CPU/CUDA Parker + Ram-Lak FBP reconstruction."""
@@ -822,7 +823,11 @@ def _reconstruct_fanbeam_fbp_batched_torch(
     if n_slices == 0 or n_pix == 0:
         return mu_slices
 
-    device = torch.device("cuda" if require_cuda else "cpu")
+    device = (
+        torch.device(target_device)
+        if target_device is not None
+        else torch.device("cuda" if require_cuda else "cpu")
+    )
     pad = max(0, int(lateral_pad_cols))
     n_ext = n_u + 2 * pad
     n_fft = max(64, _next_power_of_two(2 * n_ext))
@@ -848,24 +853,24 @@ def _reconstruct_fanbeam_fbp_batched_torch(
             vram_bytes = 14 * (1024**3)
         if vram_bytes >= 70 * (1024**3):
             # A100 (80GB) or RTX PRO 6000 (96GB)
-            slice_batch = 24 if n_pix <= 70000 else 12
-            step = 128 if n_pix <= 70000 else 64
+            slice_batch = 16 if n_pix <= 70000 else 8
+            step = 64 if n_pix <= 70000 else 48
         elif vram_bytes >= 35 * (1024**3):
             # A6000 (48GB) or A40 (48GB)
-            slice_batch = 16 if n_pix <= 70000 else 8
-            step = 96 if n_pix <= 70000 else 64
+            slice_batch = 12 if n_pix <= 70000 else 6
+            step = 48 if n_pix <= 70000 else 32
         elif vram_bytes >= 20 * (1024**3):
             # RTX 3090 / 4090 (24GB)
-            slice_batch = 12 if n_pix <= 70000 else 6
-            step = 64
+            slice_batch = 8 if n_pix <= 70000 else 4
+            step = 32
         else:
             # Tesla T4 (15GB on Kaggle), RTX 3080/4070 (10-12GB)
-            slice_batch = 8 if n_pix <= 70000 else 4
-            step = 48 if n_pix <= 70000 else 32
+            slice_batch = 4 if n_pix <= 70000 else 2
+            step = 32
         torch.cuda.empty_cache()
     else:
-        slice_batch = 4
-        step = max(16, min(max(int(angle_chunk), 32), 64))
+        slice_batch = 2
+        step = 32
 
     # Parker weights depend only on relative angle b_tilde = beta - beta[0]; reuse when uniform across slices!
     beta_f64 = np.asarray(beta_rad, dtype=np.float64)
@@ -1071,28 +1076,83 @@ def reconstruct_fanbeam_fbp(
         enabled=show_progress and n_slices > 0,
     ) as bar:
         if backend_norm in {"torch", "torch_cuda"} and n_slices > 1:
-            mu_slices = _reconstruct_fanbeam_fbp_batched_torch(
-                prep.completed_sinograms,
-                ssrb_result.beta_rad,
-                u_coords=u_coords,
-                d0_mm=d0,
-                rho0_mm=rho0,
-                du_mm=du,
-                du_iso_mm=du_iso,
-                cos_alpha=cos_alpha,
-                filter_name=fname,
-                cutoff_ratio=cutoff_ratio,
-                lateral_pad_cols=lateral_pad_cols,
-                angular_mode=ssrb_result.angular_mode,
-                x_fov=x_fov,
-                y_fov=y_fov,
-                fov_iy=fov_iy,
-                fov_ix=fov_ix,
-                n_xy=n_xy,
-                require_cuda=(backend_norm == "torch_cuda"),
-                angle_chunk=max(angle_chunk, 128),
-                progress_bar=bar,
+            num_gpus = (
+                torch.cuda.device_count()
+                if (backend_norm == "torch_cuda" and torch.cuda.is_available())
+                else 1
             )
+            if num_gpus >= 2 and n_slices >= 4:
+                # Parallel multi-GPU reconstruction across all available CUDA devices (e.g. 2x Tesla T4 on Kaggle)
+                from concurrent.futures import ThreadPoolExecutor
+
+                slices_per_gpu = int(math.ceil(n_slices / float(num_gpus)))
+                tasks = []
+                with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+                    for gi in range(num_gpus):
+                        s_start = gi * slices_per_gpu
+                        s_end = min(n_slices, (gi + 1) * slices_per_gpu)
+                        if s_start >= n_slices:
+                            continue
+                        dev = torch.device(f"cuda:{gi}")
+
+                        def _make_gpu_job(s0: int, s1: int, d: torch.device):
+                            def _job():
+                                with torch.cuda.device(d):
+                                    return s0, s1, _reconstruct_fanbeam_fbp_batched_torch(
+                                        prep.completed_sinograms[s0:s1],
+                                        ssrb_result.beta_rad[s0:s1],
+                                        u_coords=u_coords,
+                                        d0_mm=d0,
+                                        rho0_mm=rho0,
+                                        du_mm=du,
+                                        du_iso_mm=du_iso,
+                                        cos_alpha=cos_alpha,
+                                        filter_name=fname,
+                                        cutoff_ratio=cutoff_ratio,
+                                        lateral_pad_cols=lateral_pad_cols,
+                                        angular_mode=ssrb_result.angular_mode,
+                                        x_fov=x_fov,
+                                        y_fov=y_fov,
+                                        fov_iy=fov_iy,
+                                        fov_ix=fov_ix,
+                                        n_xy=n_xy,
+                                        require_cuda=True,
+                                        target_device=d,
+                                        angle_chunk=min(angle_chunk, 64),
+                                        progress_bar=None,
+                                    )
+                            return _job
+
+                        tasks.append(executor.submit(_make_gpu_job(s_start, s_end, dev)))
+                    for fut in tasks:
+                        s0, s1, part = fut.result()
+                        mu_slices[s0:s1] = part
+                        if bar is not None:
+                            bar.update(s1 - s0)
+            else:
+                mu_slices = _reconstruct_fanbeam_fbp_batched_torch(
+                    prep.completed_sinograms,
+                    ssrb_result.beta_rad,
+                    u_coords=u_coords,
+                    d0_mm=d0,
+                    rho0_mm=rho0,
+                    du_mm=du,
+                    du_iso_mm=du_iso,
+                    cos_alpha=cos_alpha,
+                    filter_name=fname,
+                    cutoff_ratio=cutoff_ratio,
+                    lateral_pad_cols=lateral_pad_cols,
+                    angular_mode=ssrb_result.angular_mode,
+                    x_fov=x_fov,
+                    y_fov=y_fov,
+                    fov_iy=fov_iy,
+                    fov_ix=fov_ix,
+                    n_xy=n_xy,
+                    require_cuda=(backend_norm == "torch_cuda"),
+                    target_device=None,
+                    angle_chunk=min(angle_chunk, 64),
+                    progress_bar=bar,
+                )
         else:
             for s_idx in range(n_slices):
                 beta_1d = np.asarray(ssrb_result.beta_rad[s_idx], dtype=np.float64)
